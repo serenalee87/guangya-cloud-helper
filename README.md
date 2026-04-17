@@ -6,6 +6,9 @@
 
 一个面向光鸭云盘网页端的油猴脚本，主要用来处理批量整理场景。
 
+感谢 Linux.do 佬友们的一切分享。
+LinuxDo地址：https://linux.do/
+
 ## 安装地址
 
 - Greasy Fork：
