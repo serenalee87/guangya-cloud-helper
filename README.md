@@ -24,6 +24,8 @@
 
 适合在 Edge / Chrome + Tampermonkey 环境下使用。
 
+<img width="1044" height="1230" alt="09cec27a7fbf020fa63e3590fb2cca9c" src="https://github.com/user-attachments/assets/1c20d111-12c9-43a1-8077-8dfa4c1e1fc8" />
+
 ## 功能介绍
 
 ### 1. 批量重命名
