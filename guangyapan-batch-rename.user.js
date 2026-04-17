@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         光鸭云盘批量助手 V4
 // @namespace    serenalee.guangyapan.batch-helper
-// @version      0.5.22
-// @description  为光鸭云盘网页端提供批量重命名、重复项预览/勾选/删除、TXT/JSON 磁力批量云添加、最里层空目录扫描与删除、进度显示与滚动列表累计识别功能。
+// @version      0.5.30
+// @description  为光鸭云盘网页端提供批量重命名、重复项预览/勾选/删除、移动整理、TXT/JSON 磁力批量云添加、最里层空目录扫描与删除、进度显示与滚动列表累计识别功能。
 // @author       Serena Lee
 // @license      Copyright (c) 2026 Serena Lee. All rights reserved.
 // @match        https://www.guangyapan.com/*
@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.5.22';
+  const SCRIPT_VERSION = '0.5.30';
 
   // =========================
   // 用户配置区：主要改这里
@@ -31,6 +31,7 @@
       listPath: '/nd.bizuserres.s/v1/file/get_file_list',
       renamePath: '/nd.bizuserres.s/v1/file/rename',
       deletePath: '/nd.bizuserres.s/v1/file/delete_file',
+      movePath: '/nd.bizuserres.s/v1/file/move_file',
       createDirPath: '/nd.bizuserres.s/v1/file/create_dir',
       taskStatusPath: '/nd.bizuserres.s/v1/get_task_status',
       resolveResPath: '/nd.bizcloudcollection.s/v1/resolve_res',
@@ -162,6 +163,10 @@
       createMagnetSubdir: false,
       listTaskPageSize: 50,
     },
+    move: {
+      targetParentId: '',
+      batchSize: 20,
+    },
   };
 
   const LOG_PREFIX = '[光鸭云盘批量助手]';
@@ -184,6 +189,10 @@
     lastRenameRequest: null,
     duplicatePreviewItems: [],
     duplicateSelection: {},
+    moveSelectionPreviewItems: [],
+    moveSelectionExpectedCount: 0,
+    moveSelectionSource: 'visible',
+    moveSelectionWarning: '',
     emptyDirSelection: {},
     magnetImportFiles: [],
     lastCloudImportSummary: null,
@@ -213,6 +222,9 @@
     duplicateDetails: null,
     duplicateList: null,
     duplicateCount: null,
+    moveDetails: null,
+    moveSelectionList: null,
+    moveSelectionCount: null,
     emptyDirList: null,
     emptyDirCount: null,
     emptyDirDetails: null,
@@ -527,6 +539,14 @@
             CONFIG.cloud.listTaskPageSize = Math.max(1, Number(saved.cloud.listTaskPageSize));
           }
         }
+        if (saved.move && typeof saved.move === 'object') {
+          if (typeof saved.move.targetParentId === 'string') {
+            CONFIG.move.targetParentId = saved.move.targetParentId;
+          }
+          if (saved.move.batchSize != null && !Number.isNaN(Number(saved.move.batchSize))) {
+            CONFIG.move.batchSize = Math.max(1, Number(saved.move.batchSize));
+          }
+        }
       }
     } catch (err) {
       warn('读取已保存配置失败：', err);
@@ -565,6 +585,10 @@
           sourceDirPrefix: CONFIG.cloud.sourceDirPrefix,
           createMagnetSubdir: CONFIG.cloud.createMagnetSubdir,
           listTaskPageSize: CONFIG.cloud.listTaskPageSize,
+        },
+        move: {
+          targetParentId: CONFIG.move.targetParentId,
+          batchSize: CONFIG.move.batchSize,
         },
       };
       window.localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(payload));
@@ -894,6 +918,10 @@
 
   function getDeleteUrl() {
     return `${CONFIG.request.apiHost}${CONFIG.request.deletePath}`;
+  }
+
+  function getMoveUrl() {
+    return `${CONFIG.request.apiHost}${CONFIG.request.movePath}`;
   }
 
   function getCreateDirUrl() {
@@ -2014,7 +2042,7 @@
         pageSize,
       };
       if (pageIndex > 0) {
-        requestBody.page = pageIndex;
+        requestBody.page = pageIndex + 1;
       }
 
       const { items } = await requestListBatch(requestBody);
@@ -3040,6 +3068,13 @@
     };
   }
 
+  function hasUsefulTaskState(payload, expectedTotal = 0) {
+    const status = extractTaskStatus(payload);
+    const counts = extractTaskCounts(payload, expectedTotal);
+    const rawProgress = Number(findFirstValueByKeys(payload, ['progress', 'percent', 'percentage']));
+    return Boolean(status || counts.hasExplicitCounts || Number.isFinite(rawProgress));
+  }
+
   function isTaskFinished(payload, options = {}) {
     const status = extractTaskStatus(payload);
     if (status) {
@@ -3122,6 +3157,11 @@
 
   async function deleteFiles(fileIds) {
     return postJson(getDeleteUrl(), { fileIds }, getRequestHeaders());
+  }
+
+  async function moveFiles(fileIds, parentId) {
+    const normalizedFileIds = Array.from(new Set((fileIds || []).map((id) => String(id || '').trim()).filter(Boolean)));
+    return postJson(getMoveUrl(), { fileIds: normalizedFileIds, parentId: String(parentId || '').trim() }, getRequestHeaders());
   }
 
   async function getTaskStatus(taskId) {
@@ -4207,6 +4247,21 @@
     return text.startsWith('#') ? text : `#${text.replace(/^#*/, '')}`;
   }
 
+  function extractDirectoryIdFromHashSegment(segment) {
+    const matched = String(segment || '').trim().match(/^(\d{8,})-/u);
+    return matched ? String(matched[1] || '') : '';
+  }
+
+  function getCurrentDirectoryParentIdFromHash(hash = location.hash) {
+    const normalizedHash = normalizeHashRoute(hash).replace(/^#\/?/u, '');
+    const segments = normalizedHash.split('/').filter(Boolean);
+    const ids = segments.map((segment) => extractDirectoryIdFromHashSegment(segment)).filter(Boolean);
+    if (ids.length < 2) {
+      return '';
+    }
+    return String(ids[ids.length - 2] || '').trim();
+  }
+
   function buildChildDirectoryHash(previousSnapshot, childItem) {
     const childId = String(childItem?.fileId || childItem?.dirId || '').trim();
     const childName = String(childItem?.name || '').trim();
@@ -4298,7 +4353,7 @@
       return false;
     }
 
-    const blacklist = ['上传', '新建文件夹', '云添加', '文件', '文件名称', '大小', '类型', '文件夹', '-'];
+    const blacklist = ['上传', '新建文件夹', '云添加', '文件', '文件名称', '大小', '类型', '文件夹', '其他', '未知类型', 'typeunknown', '-'];
     if (blacklist.includes(text)) {
       return false;
     }
@@ -4313,6 +4368,8 @@
     }
 
     return (
+      /^(type(?:unknown|file|folder|video|audio|image|document|other|torrent)|filetypeunknown)$/i.test(value) ||
+      /^(其他|未知类型|文件类型)$/u.test(value) ||
       /^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|PB)$/i.test(value) ||
       /^\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}/.test(value) ||
       /^(今天|昨天|刚刚|\d{1,2}:\d{2})$/.test(value) ||
@@ -5226,6 +5283,900 @@
     }
   }
 
+  function buildCheckedPageSelectionPreviewItems(options = {}) {
+    const onlyDirectories = Boolean(options.onlyDirectories);
+    const entries = dedupeElements([
+      ...collectVisibleListRowEntries(),
+      ...collectCheckedListRowEntries(),
+    ]);
+    const seen = new Set();
+    const out = [];
+
+    for (const entry of entries) {
+      if (!entry?.checkbox || !isElementChecked(entry.checkbox)) {
+        continue;
+      }
+      if (onlyDirectories && !entry.isDir) {
+        continue;
+      }
+
+      const normalizedName = normalizeDomName(entry.name || '');
+      const key = `${entry.isDir ? 'dir' : 'file'}:${normalizedName}`;
+      if (!normalizedName || seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      out.push({
+        fileId: `dom:checked:${out.length}:${entry.name}`,
+        name: String(entry.name || ''),
+        isDir: entry.isDir === true,
+        resolved: false,
+      });
+    }
+
+    return out;
+  }
+
+  function collectCheckedListRowEntries() {
+    const checkboxNodes = Array.from(document.querySelectorAll(
+      'input[type="checkbox"], label[role="checkbox"], [role="checkbox"], [aria-label*="选择"], button[aria-label*="选择"], [data-testid*="checkbox"], [class*="checkbox"], [class*="check"]'
+    ));
+    const seen = new Set();
+    const out = [];
+
+    for (const checkbox of checkboxNodes) {
+      if (!checkbox || isHelperPanelNode(checkbox) || !isElementChecked(checkbox)) {
+        continue;
+      }
+
+      const row = getClosestRow(checkbox);
+      if (!row || !isUsableListRow(row)) {
+        continue;
+      }
+
+      const name = extractNameFromRow(row);
+      const normalizedName = normalizeDomName(name);
+      const checkboxInRow = getCheckboxInRow(row) || checkbox;
+      const key = `${guessDomRowIsDirectory(row, name) ? 'dir' : 'file'}:${normalizedName}`;
+      if (!normalizedName || !isProbablyUsefulName(name) || seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      out.push({
+        row,
+        name,
+        normalizedName,
+        checkbox: checkboxInRow,
+        isDir: guessDomRowIsDirectory(row, name),
+      });
+    }
+
+    return out;
+  }
+
+  async function collectCheckedPageSelectionByScrolling(options = {}) {
+    const container = options.container || findScrollableListContainer();
+    const taskControl = options.taskControl || null;
+    const expectedCount = Math.max(0, Number(options.expectedCount || 0));
+    const maxRounds = Math.max(1, Number(options.maxRounds || 48));
+    const isDocumentScroller =
+      container === document.scrollingElement ||
+      container === document.documentElement ||
+      container === document.body;
+    const startScroll = container
+      ? (isDocumentScroller ? (window.scrollY || window.pageYOffset || 0) : container.scrollTop)
+      : 0;
+    const deltaY = Math.max(280, Math.floor((container?.clientHeight || window.innerHeight || 640) * 0.72));
+    const seen = new Map();
+
+    const addItems = (items = []) => {
+      for (const item of items) {
+        if (!item) {
+          continue;
+        }
+        const key = `${item.isDir ? 'dir' : 'file'}:${normalizeDomName(item.name || '')}`;
+        if (!key || seen.has(key)) {
+          continue;
+        }
+        seen.set(key, item);
+      }
+    };
+
+    try {
+      if (container) {
+        if (isDocumentScroller) {
+          window.scrollTo({ top: 0, behavior: 'auto' });
+        } else {
+          container.scrollTop = 0;
+        }
+        await sleep(180);
+      }
+
+      for (let round = 0; round < maxRounds; round += 1) {
+        await waitForTaskControl(taskControl);
+        addItems(buildCheckedPageSelectionPreviewItems({ onlyDirectories: false }));
+
+        if (expectedCount > 0 && seen.size >= expectedCount) {
+          break;
+        }
+
+        const moved = await scrollListContainer(container, deltaY);
+        if (!moved) {
+          break;
+        }
+      }
+    } finally {
+      if (container) {
+        if (isDocumentScroller) {
+          window.scrollTo({ top: startScroll, behavior: 'auto' });
+        } else {
+          container.scrollTop = startScroll;
+        }
+      }
+    }
+
+    return Array.from(seen.values());
+  }
+
+  function getPageSelectedCount() {
+    const pattern = /(?:已选(?:择)?|已勾选|selected)\s*(\d+)\s*项/iu;
+    let maxCount = 0;
+    const nodes = Array.from(document.querySelectorAll('span, div, p, strong, b, em, button'));
+
+    for (const node of nodes) {
+      if (!node || !isVisibleElement(node) || isHelperPanelNode(node)) {
+        continue;
+      }
+      const text = normalizeDomName(node.textContent || node.innerText || '');
+      if (!text || text.length > 40) {
+        continue;
+      }
+      const matched = text.match(pattern);
+      if (!matched) {
+        continue;
+      }
+      const count = Number(matched[1] || 0);
+      if (Number.isFinite(count) && count > maxCount) {
+        maxCount = count;
+      }
+    }
+
+    return maxCount;
+  }
+
+  async function collectCheckedPageSelectionPreviewItems(options = {}) {
+    const onlyDirectories = Boolean(options.onlyDirectories);
+    const taskControl = options.taskControl || null;
+    const visibleAllItems = buildCheckedPageSelectionPreviewItems({ onlyDirectories: false });
+    const visibleItems = onlyDirectories ? visibleAllItems.filter((item) => item.isDir) : visibleAllItems;
+    const pageSelectedCount = Math.max(0, Number(options.pageSelectedCount != null ? options.pageSelectedCount : getPageSelectedCount()) || 0);
+    const currentParentId = String(getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '').trim();
+    const capturedItems = dedupeItems(getCapturedItems() || []);
+    const capturedCount = capturedItems.length;
+    const visibleCount = visibleAllItems.length;
+
+    if (!pageSelectedCount || visibleCount >= pageSelectedCount) {
+      return {
+        items: visibleItems,
+        meta: {
+          expectedCount: Math.max(pageSelectedCount, visibleCount, visibleItems.length),
+          visibleCount,
+          partial: false,
+          source: 'visible',
+          warning: '',
+        },
+      };
+    }
+
+    const scannedAllItems = await collectCheckedPageSelectionByScrolling({
+      taskControl,
+      expectedCount: pageSelectedCount,
+      maxRounds: Math.max(24, Math.min(96, pageSelectedCount + 18)),
+    });
+    const scannedAllCount = scannedAllItems.length;
+    const scannedItems = onlyDirectories
+      ? scannedAllItems.filter((item) => item.isDir === true)
+      : scannedAllItems;
+
+    if (scannedAllCount >= pageSelectedCount) {
+      return {
+        items: scannedItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: scannedAllCount,
+          partial: false,
+          source: 'scroll-scan',
+          warning: onlyDirectories
+            ? `页面已选 ${pageSelectedCount} 项，已滚动扫描完整个列表；其中勾选文件夹 ${scannedItems.length} 项。`
+            : `页面已选 ${pageSelectedCount} 项，已滚动扫描完整个列表并补齐全部勾选项。`,
+        },
+      };
+    }
+
+    if (capturedCount && capturedCount === pageSelectedCount) {
+      const normalizedCapturedItems = capturedItems.map((item) => ({
+        ...item,
+        resolved: true,
+      }));
+      const matchedItems = onlyDirectories
+        ? normalizedCapturedItems.filter((item) => item.isDir === true || shouldTreatItemAsDirectory(item))
+        : normalizedCapturedItems;
+      return {
+        items: matchedItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount,
+          partial: false,
+          source: 'captured-all-current-dir',
+          warning: onlyDirectories
+            ? `页面已选 ${pageSelectedCount} 项，已使用脚本累计识别的当前目录列表补齐；其中可操作文件夹 ${matchedItems.length} 项。`
+            : `页面已选 ${pageSelectedCount} 项，已使用脚本累计识别的当前目录列表补齐全部勾选项。`,
+        },
+      };
+    }
+
+    if (!currentParentId) {
+      return {
+        items: visibleItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: Math.max(visibleCount, scannedAllCount),
+          partial: true,
+          source: 'scroll-partial',
+          warning: `页面显示已选 ${pageSelectedCount} 项，脚本已尝试滚动扫描整页，但目前只识别到 ${Math.max(visibleCount, scannedAllCount)} 项；还没拿到当前目录 parentId，暂时无法继续补齐。`,
+        },
+      };
+    }
+
+    const verifiedPageSize = Math.max(
+      Number(UI.fields.pageSize?.value || 0),
+      Number(CONFIG.request.manualListBody.pageSize || 0),
+      Number(getCurrentListContext().capturedCount || 0),
+      pageSelectedCount,
+      200
+    );
+
+    try {
+      const listing = await fetchDirectoryItemsByParentId(currentParentId, {
+        pageSize: verifiedPageSize,
+        maxPages: Math.max(2, Math.ceil(pageSelectedCount / Math.max(1, verifiedPageSize)) + 2),
+        delayMs: 0,
+        taskControl,
+      });
+      const fullItems = dedupeItems(listing.items || []);
+
+      if (!listing.truncated && fullItems.length === pageSelectedCount) {
+        const normalizedFullItems = fullItems.map((item) => ({
+          ...item,
+          resolved: true,
+        }));
+        return {
+          items: onlyDirectories
+            ? normalizedFullItems.filter((item) => item.isDir === true || shouldTreatItemAsDirectory(item))
+            : normalizedFullItems,
+          meta: {
+            expectedCount: pageSelectedCount,
+            visibleCount,
+            partial: false,
+            source: 'all-current-dir',
+            warning: onlyDirectories
+              ? `页面已选 ${pageSelectedCount} 项，已按“当前目录全选”补齐；其中可操作文件夹 ${normalizedFullItems.filter((item) => item.isDir === true || shouldTreatItemAsDirectory(item)).length} 项。`
+              : `页面已选 ${pageSelectedCount} 项，已按“当前目录全选”自动补齐全部勾选项。`,
+          },
+        };
+      }
+
+      return {
+        items: scannedItems.length > visibleItems.length ? scannedItems : visibleItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: Math.max(visibleCount, scannedAllCount),
+          partial: true,
+          source: 'scroll-partial',
+          warning: `页面显示已选 ${pageSelectedCount} 项，脚本已尝试滚动扫描整页，但目前只识别到 ${Math.max(visibleCount, scannedAllCount)} 项。请稍等列表继续加载，或上下滚动一次后再试。`,
+        },
+      };
+    } catch (err) {
+      return {
+        items: scannedItems.length > visibleItems.length ? scannedItems : visibleItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: Math.max(visibleCount, scannedAllCount),
+          partial: true,
+          source: 'scroll-partial',
+          warning: `页面显示已选 ${pageSelectedCount} 项，滚动扫描后识别到 ${Math.max(visibleCount, scannedAllCount)} 项；继续补齐失败：${getErrorText(err) || '未知错误'}。`,
+        },
+      };
+    }
+  }
+
+  function renderMoveSelectionList() {
+    if (!UI.moveSelectionList || !UI.moveSelectionCount) {
+      return;
+    }
+
+    const items = Array.isArray(STATE.moveSelectionPreviewItems) ? STATE.moveSelectionPreviewItems : [];
+    const expectedCount = Math.max(0, Number(STATE.moveSelectionExpectedCount || 0));
+    const warning = String(STATE.moveSelectionWarning || '').trim();
+    UI.moveSelectionCount.textContent =
+      expectedCount > items.length
+        ? `当前勾选 ${items.length}/${expectedCount} 项`
+        : `当前勾选 ${Math.max(items.length, expectedCount)} 项`;
+
+    if (!items.length) {
+      UI.moveSelectionList.innerHTML = `
+        ${warning ? `<div class="gyp-import-empty">${escapeHtml(warning)}</div>` : ''}
+        <div class="gyp-import-empty">点“读取当前勾选”后，这里会显示当前页面已勾选的文件 / 文件夹。</div>
+      `;
+      return;
+    }
+
+    UI.moveSelectionList.innerHTML = `
+      ${warning ? `<div class="gyp-import-empty">${escapeHtml(warning)}</div>` : ''}
+      ${items.map((item) => `
+      <div class="gyp-import-row">
+        <div class="gyp-import-name" title="${escapeHtml(String(item.name || ''))}">${escapeHtml(String(item.name || ''))}</div>
+        <div class="gyp-import-meta">${item.isDir ? '文件夹' : '文件'} | ${item.resolved ? `已识别 fileId: ${escapeHtml(String(item.fileId || ''))}` : '仅识别到当前页面勾选，执行前会自动补齐真实 fileId'}</div>
+      </div>
+      `).join('')}
+    `;
+  }
+
+  function setMoveSelectionPreview(items = [], meta = {}) {
+    STATE.moveSelectionPreviewItems = (items || []).filter(Boolean).map((item) => ({
+      fileId: String(item.fileId || ''),
+      name: String(item.name || ''),
+      isDir: item.isDir === true,
+      resolved: Boolean(item.resolved || (item.fileId && !String(item.fileId).startsWith('dom:'))),
+      parentId: String(item.parentId || ''),
+      dirId: String(item.dirId || item.fileId || ''),
+      dirIdCandidates: normalizeIdCandidates(item.dirIdCandidates || [item.dirId, item.fileId]),
+    }));
+    STATE.moveSelectionExpectedCount = Math.max(0, Number(meta.expectedCount || 0));
+    STATE.moveSelectionSource = String(meta.source || 'visible');
+    STATE.moveSelectionWarning = String(meta.warning || '');
+    renderMoveSelectionList();
+    if (UI.moveDetails) {
+      UI.moveDetails.open = true;
+    }
+  }
+
+  function resolveCheckedMoveItemsByName(previewItems, sourceItems) {
+    const exactMap = new Map();
+
+    for (const item of sourceItems || []) {
+      if (!item || !item.fileId || String(item.fileId).startsWith('dom:')) {
+        continue;
+      }
+      const key = normalizeDomName(item.name);
+      if (!key) {
+        continue;
+      }
+      if (!exactMap.has(key)) {
+        exactMap.set(key, []);
+      }
+      exactMap.get(key).push(item);
+    }
+
+    const merged = [];
+    const resolved = [];
+    const unresolved = [];
+
+    for (const item of previewItems || []) {
+      if (!item) {
+        continue;
+      }
+
+      if (item.fileId && !String(item.fileId).startsWith('dom:')) {
+        const normalized = {
+          fileId: String(item.fileId),
+          dirId: String(item.dirId || item.fileId),
+          dirIdCandidates: normalizeIdCandidates(item.dirIdCandidates || [item.dirId, item.fileId]),
+          name: String(item.name || ''),
+          parentId: String(item.parentId || ''),
+          isDir: item.isDir === true,
+          raw: item.raw,
+          resolved: true,
+        };
+        merged.push(normalized);
+        resolved.push(normalized);
+        continue;
+      }
+
+      const key = normalizeDomName(item.name);
+      const matches = key ? (exactMap.get(key) || []) : [];
+      const typeMatched = matches.filter((candidate) => {
+        const candidateIsDir = candidate.isDir === true || shouldTreatItemAsDirectory(candidate);
+        return candidateIsDir === (item.isDir === true);
+      });
+      const chosen = typeMatched.length === 1 ? typeMatched[0] : (matches.length === 1 ? matches[0] : null);
+
+      if (chosen) {
+        const normalized = {
+          fileId: String(chosen.fileId),
+          dirId: String(chosen.dirId || chosen.fileId),
+          dirIdCandidates: normalizeIdCandidates(chosen.dirIdCandidates || [chosen.dirId, chosen.fileId]),
+          name: String(chosen.name || item.name || ''),
+          parentId: String(chosen.parentId || ''),
+          isDir: chosen.isDir === true || shouldTreatItemAsDirectory(chosen),
+          raw: chosen.raw,
+          resolved: true,
+        };
+        merged.push(normalized);
+        resolved.push(normalized);
+      } else {
+        const fallback = {
+          fileId: String(item.fileId || ''),
+          dirId: String(item.dirId || item.fileId || ''),
+          dirIdCandidates: normalizeIdCandidates(item.dirIdCandidates || [item.dirId, item.fileId]),
+          name: String(item.name || ''),
+          parentId: String(item.parentId || ''),
+          isDir: item.isDir === true,
+          raw: item.raw,
+          resolved: false,
+        };
+        merged.push(fallback);
+        unresolved.push(fallback);
+      }
+    }
+
+    return {
+      merged,
+      resolved,
+      unresolved,
+    };
+  }
+
+  async function ensureCheckedMoveItemsHaveRealIds(previewItems, options = {}) {
+    const domItems = (previewItems || []).filter((item) => String(item?.fileId || '').startsWith('dom:'));
+    if (!domItems.length) {
+      return {
+        mergedItems: (previewItems || []).map((item) => ({
+          ...item,
+          fileId: String(item.fileId || ''),
+          dirId: String(item.dirId || item.fileId || ''),
+          dirIdCandidates: normalizeIdCandidates(item.dirIdCandidates || [item.dirId, item.fileId]),
+          name: String(item.name || ''),
+          parentId: String(item.parentId || ''),
+          isDir: item.isDir === true,
+          resolved: true,
+        })),
+        resolved: (previewItems || []).map((item) => ({
+          ...item,
+          fileId: String(item.fileId || ''),
+          dirId: String(item.dirId || item.fileId || ''),
+          dirIdCandidates: normalizeIdCandidates(item.dirIdCandidates || [item.dirId, item.fileId]),
+          name: String(item.name || ''),
+          parentId: String(item.parentId || ''),
+          isDir: item.isDir === true,
+          resolved: true,
+        })),
+        unresolved: [],
+        source: 'existing',
+      };
+    }
+
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const context = getCurrentListContext();
+    const candidateSources = [];
+    const verifiedPageSize = Math.max(
+      Number(UI.fields.pageSize?.value || 0),
+      Number(CONFIG.request.manualListBody.pageSize || 0),
+      Number(getCapturedItems().length || 0),
+      Number((previewItems || []).length || 0) + 50,
+      200
+    );
+
+    if (onProgress) {
+      onProgress({
+        visible: true,
+        percent: 8,
+        indeterminate: true,
+        text: '正在补齐当前勾选项的真实 fileId...',
+      });
+    }
+
+    try {
+      const fetched = await fetchCurrentList({ pageSize: verifiedPageSize });
+      if (fetched.length) {
+        candidateSources.push({
+          source: 'api',
+          items: fetched,
+        });
+      }
+    } catch (err) {
+      warn('移动前补齐真实 fileId 时，接口拉取列表失败：', err);
+    }
+
+    const captured = getCapturedItems();
+    if (captured.length) {
+      candidateSources.push({
+        source: 'captured',
+        items: captured,
+      });
+    }
+
+    const snapshotItems = buildCurrentDirectoryItemsSnapshot(context.parentId);
+    if (snapshotItems.length) {
+      candidateSources.push({
+        source: 'snapshot',
+        items: snapshotItems,
+      });
+    }
+
+    for (const entry of candidateSources) {
+      const mapping = resolveCheckedMoveItemsByName(previewItems, entry.items);
+      if (!mapping.unresolved.length) {
+        return {
+          mergedItems: mapping.merged,
+          resolved: mapping.resolved,
+          unresolved: [],
+          source: entry.source,
+        };
+      }
+    }
+
+    const best = candidateSources.length
+      ? resolveCheckedMoveItemsByName(previewItems, candidateSources[0].items)
+      : {
+          merged: (previewItems || []).map((item) => ({
+            ...item,
+            fileId: String(item.fileId || ''),
+            dirId: String(item.dirId || item.fileId || ''),
+            dirIdCandidates: normalizeIdCandidates(item.dirIdCandidates || [item.dirId, item.fileId]),
+            name: String(item.name || ''),
+            parentId: String(item.parentId || ''),
+            isDir: item.isDir === true,
+            resolved: false,
+          })),
+          resolved: [],
+          unresolved: domItems.map((item) => ({
+            ...item,
+            fileId: String(item.fileId || ''),
+            dirId: String(item.dirId || item.fileId || ''),
+            dirIdCandidates: normalizeIdCandidates(item.dirIdCandidates || [item.dirId, item.fileId]),
+            name: String(item.name || ''),
+            parentId: String(item.parentId || ''),
+            isDir: item.isDir === true,
+            resolved: false,
+          })),
+        };
+
+    return {
+      mergedItems: best.merged,
+      resolved: best.resolved,
+      unresolved: best.unresolved,
+      source: candidateSources[0]?.source || 'none',
+    };
+  }
+
+  async function collectResolvedCheckedMoveItems(options = {}) {
+    const selection = await collectCheckedPageSelectionPreviewItems({
+      onlyDirectories: Boolean(options.onlyDirectories),
+      taskControl: options.taskControl || null,
+    });
+    const previewItems = selection.items || [];
+    setMoveSelectionPreview(previewItems, selection.meta);
+
+    if (!previewItems.length) {
+      throw new Error(options.onlyDirectories ? '当前页面没有勾选任何文件夹。' : '当前页面没有勾选任何文件或文件夹。');
+    }
+
+    if (selection.meta?.partial) {
+      throw new Error(
+        selection.meta.warning
+        || `页面显示已选 ${selection.meta?.expectedCount || 0} 项，但当前只能识别到 ${selection.meta?.visibleCount || previewItems.length} 项。`
+      );
+    }
+
+    const ensured = await ensureCheckedMoveItemsHaveRealIds(previewItems, {
+      onProgress: options.onProgress,
+    });
+    setMoveSelectionPreview(ensured.mergedItems, selection.meta);
+
+    if (ensured.unresolved.length) {
+      const sample = ensured.unresolved.slice(0, 6).map((item) => item.name).filter(Boolean).join('、');
+      throw new Error(
+        `当前有 ${ensured.unresolved.length} 个勾选项没拿到真实 fileId。请先等待当前目录列表加载完整，或刷新页面后再试。${sample ? ` 未识别示例：${sample}` : ''}`
+      );
+    }
+
+    return ensured.resolved;
+  }
+
+  async function moveFilesInBatches(fileIds, parentId, options = {}) {
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const taskControl = options.taskControl || null;
+    const batchSize = Math.max(1, Number(options.batchSize || CONFIG.move.batchSize || 100));
+    const label = String(options.label || '移动项目');
+    const allowSplitRetry = options.allowSplitRetry !== false;
+    const verifySourceItems = Array.isArray(options.verifySourceItems) ? options.verifySourceItems.filter(Boolean) : [];
+    const uniqueIds = Array.from(new Set((fileIds || []).map((id) => String(id || '').trim()).filter(Boolean)));
+    const batches = chunkArray(uniqueIds, batchSize);
+    const summary = {
+      ok: 0,
+      fail: 0,
+      submittedBatches: 0,
+      taskIds: [],
+      movedFileIds: [],
+      firstError: '',
+    };
+
+    for (let index = 0; index < batches.length; index += 1) {
+      await waitForTaskControl(taskControl);
+      const batch = batches[index];
+      const batchSourceItems = verifySourceItems.filter((item) => batch.includes(String(item?.fileId || '')));
+      if (onProgress) {
+        onProgress({
+          visible: true,
+          percent: Math.round((index / Math.max(1, batches.length)) * 100),
+          indeterminate: true,
+          text: `${label}：正在提交第 ${index + 1}/${batches.length} 批，共 ${batch.length} 项`,
+        });
+      }
+
+      try {
+        const moveRes = await moveFiles(batch, parentId);
+        if (!moveRes.ok || !isProbablySuccess(moveRes.payload, moveRes)) {
+          throw new Error(getErrorText(moveRes.payload || moveRes.text || `HTTP ${moveRes.status}`));
+        }
+
+        summary.submittedBatches += 1;
+        const taskId = extractTaskId(moveRes.payload);
+        if (!taskId) {
+          summary.ok += batch.length;
+          summary.movedFileIds.push(...batch);
+          continue;
+        }
+
+        summary.taskIds.push(taskId);
+        if (onProgress) {
+          onProgress({
+            visible: true,
+            percent: Math.max(10, Math.round((index / Math.max(1, batches.length)) * 100)),
+            indeterminate: true,
+            text: `${label}：第 ${index + 1}/${batches.length} 批已提交，taskId: ${taskId}`,
+          });
+        }
+
+        const task = await waitTaskUntilDone(taskId, {
+          onProgress,
+          taskControl,
+          expectedTotal: batch.length,
+          maxTries: batchSourceItems.length ? Math.min(Math.max(CONFIG.batch.taskPollMaxTries || 12, 12), 24) : Math.max(CONFIG.batch.taskPollMaxTries || 180, 180),
+          intervalMs: Math.max(CONFIG.batch.taskPollMs || 1500, 1500),
+        });
+        if (batchSourceItems.length && (!task.ok || !hasUsefulTaskState(task.result?.payload, batch.length))) {
+          const verification = await verifyMovedItemsByList(batchSourceItems, {
+            onProgress,
+            taskControl,
+            maxRounds: 6,
+            intervalMs: Math.max(CONFIG.batch.taskPollMs || 1500, 1500),
+          });
+          if (verification.movedItems.length) {
+            summary.ok += verification.movedItems.length;
+            summary.fail += verification.remaining.length;
+            summary.movedFileIds.push(...verification.movedItems.map((item) => String(item.fileId || '')).filter(Boolean));
+            if (verification.ok) {
+              continue;
+            }
+          }
+          if (!verification.movedItems.length && allowSplitRetry && batch.length > 1) {
+            const nextBatchSize = batch.length > 20 ? 20 : 1;
+            if (nextBatchSize < batch.length) {
+              if (onProgress) {
+                onProgress({
+                  visible: true,
+                  percent: Math.max(15, Math.round((index / Math.max(1, batches.length)) * 100)),
+                  indeterminate: true,
+                  text: `${label}：当前整批未实际移走，正在按更小批次重试（${batch.length} -> ${nextBatchSize}）`,
+                });
+              }
+              const retried = await moveFilesInBatches(batch, parentId, {
+                onProgress,
+                taskControl,
+                label: `${label}小批重试`,
+                batchSize: nextBatchSize,
+                verifySourceItems: batchSourceItems,
+                allowSplitRetry: nextBatchSize > 1,
+              });
+              summary.ok += retried.ok;
+              summary.fail += retried.fail;
+              summary.submittedBatches += retried.submittedBatches;
+              summary.taskIds.push(...(retried.taskIds || []));
+              summary.movedFileIds.push(...(retried.movedFileIds || []));
+              if (!summary.firstError && retried.firstError) {
+                summary.firstError = retried.firstError;
+              }
+              continue;
+            }
+          }
+        }
+
+        if (!task.ok) {
+          const payload = task.result?.payload || task.result?.text || {};
+          throw new Error(
+            task.timeout
+              ? `${label}任务超时，taskId: ${taskId}`
+              : `${label}任务失败，taskId: ${taskId}，${getErrorText(payload) || '未返回更多信息'}`
+          );
+        }
+
+        const taskCounts = extractTaskCounts(task.result?.payload, batch.length);
+        const okCount = taskCounts.hasSuccessCount ? taskCounts.success : batch.length;
+        const failCount = taskCounts.hasFailedCount ? taskCounts.failed : 0;
+        summary.ok += okCount;
+        summary.fail += failCount;
+        if (failCount === 0) {
+          summary.movedFileIds.push(...batch);
+        }
+      } catch (err) {
+        summary.fail += batch.length;
+        summary.firstError = summary.firstError || getErrorText(err);
+        warn(`${label}失败：`, err);
+        if (CONFIG.batch.stopOnError) {
+          break;
+        }
+      }
+    }
+
+    if (onProgress) {
+      onProgress({
+        visible: true,
+        percent: 100,
+        indeterminate: false,
+        text: `${label}完成：成功 ${summary.ok} 项，失败 ${summary.fail} 项`,
+      });
+    }
+
+    return summary;
+  }
+
+  async function moveCheckedFolderContentsToCurrentDirectory(options = {}) {
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const taskControl = options.taskControl || null;
+    const currentParentId = String(getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '').trim();
+    if (!currentParentId) {
+      throw new Error('没有拿到当前目录 parentId。请先打开目标上层目录，或在高级兜底里手填 parentId。');
+    }
+
+    const folders = await collectResolvedCheckedMoveItems({
+      onlyDirectories: true,
+      onProgress,
+    });
+    const sourceFolders = folders.filter((item) => item.isDir);
+    if (!sourceFolders.length) {
+      throw new Error('当前页面没有勾选任何可识别的文件夹。');
+    }
+
+    const childItems = [];
+    const childSeen = new Set();
+    let truncatedFolderCount = 0;
+    for (let index = 0; index < sourceFolders.length; index += 1) {
+      const folder = sourceFolders[index];
+      await waitForTaskControl(taskControl);
+      if (onProgress) {
+        onProgress({
+          visible: true,
+          percent: Math.min(45, Math.round(((index + 1) / Math.max(1, sourceFolders.length)) * 45)),
+          indeterminate: true,
+          text: `正在读取文件夹内容 ${index + 1}/${sourceFolders.length}：${shortDisplayName(folder.name, 36)}`,
+        });
+      }
+
+      const listing = await fetchDirectoryItems(folder.fileId, {
+        idCandidates: normalizeIdCandidates([folder.fileId, folder.dirId, ...(folder.dirIdCandidates || [])]),
+        taskControl,
+      });
+      if (listing.truncated) {
+        truncatedFolderCount += 1;
+      }
+
+      for (const child of listing.items || []) {
+        const key = String(child?.fileId || '').trim();
+        if (!key || childSeen.has(key)) {
+          continue;
+        }
+        childSeen.add(key);
+        childItems.push({
+          ...child,
+          parentId: currentParentId,
+        });
+      }
+    }
+
+    if (!childItems.length) {
+      throw new Error('勾选的文件夹里没有可移动的内容。空文件夹不会自动删除。');
+    }
+
+    if (CONFIG.batch.confirmBeforeRun && !window.confirm(`准备拆开 ${sourceFolders.length} 个已勾选文件夹，把里面的 ${childItems.length} 项直接内容移动到当前目录。这个操作不会保留外层文件夹，是否继续？`)) {
+      return { ok: 0, fail: 0, movedItems: [], folders: sourceFolders, truncatedFolderCount };
+    }
+
+    const result = await moveFilesInBatches(
+      childItems.map((item) => item.fileId),
+      currentParentId,
+      {
+        onProgress,
+        taskControl,
+        label: '文件夹内容提到上一层',
+      }
+    );
+
+    if (result.fail === 0 && childItems.length) {
+      mergeCapturedItems(currentParentId, childItems, { countAsBatch: false });
+    }
+
+    return {
+      ...result,
+      movedItems: childItems,
+      folders: sourceFolders,
+      truncatedFolderCount,
+    };
+  }
+
+  async function moveCheckedItemsUpOneLevel(options = {}) {
+    const targetParentId = String(options.parentId || getCurrentDirectoryParentIdFromHash(location.hash)).trim();
+    if (!targetParentId) {
+      throw new Error('没识别出“当前目录的上一层 parentId”。请改用“勾选项移到目标目录”，手动填目标目录 parentId。');
+    }
+
+    return moveCheckedItemsToTargetDirectory({
+      ...options,
+      parentId: targetParentId,
+    });
+  }
+
+  async function moveCheckedItemsToTargetDirectory(options = {}) {
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const taskControl = options.taskControl || null;
+    const currentParentId = String(getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '').trim();
+    const targetParentId = String(options.parentId != null ? options.parentId : (UI.fields.moveTargetParentId?.value || CONFIG.move.targetParentId || '')).trim();
+
+    if (!targetParentId) {
+      throw new Error('请先填写目标目录 parentId。');
+    }
+    if (currentParentId && targetParentId === currentParentId) {
+      throw new Error('目标目录就是当前目录，当前勾选项已经在这里了。');
+    }
+
+    const checkedItems = await collectResolvedCheckedMoveItems({
+      onlyDirectories: false,
+      onProgress,
+    });
+    if (!checkedItems.length) {
+      throw new Error('当前页面没有勾选任何可移动的文件或文件夹。');
+    }
+
+    if (CONFIG.batch.confirmBeforeRun && !window.confirm(`准备把当前页面已勾选的 ${checkedItems.length} 项移动到目录 ${targetParentId}，是否继续？`)) {
+      return { ok: 0, fail: 0, movedItems: checkedItems, targetParentId };
+    }
+
+    const result = await moveFilesInBatches(
+      checkedItems.map((item) => item.fileId),
+      targetParentId,
+      {
+        onProgress,
+        taskControl,
+        label: '移动勾选项到目标目录',
+        verifySourceItems: checkedItems,
+      }
+    );
+
+    if ((result.movedFileIds || []).length) {
+      removeCapturedItemsByIds(result.movedFileIds);
+    } else if (result.fail === 0 && checkedItems.length) {
+      removeCapturedItemsByIds(checkedItems.map((item) => item.fileId));
+    }
+
+    return {
+      ...result,
+      movedItems: checkedItems,
+      targetParentId,
+    };
+  }
+
   async function run(options = {}) {
     const targets = await preview(options);
     const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
@@ -5328,6 +6279,10 @@
       })),
       lastCloudImportSummary: STATE.lastCloudImportSummary,
       lastCloudTaskCount: extractCloudTaskRows(STATE.lastCloudTaskList).length,
+      moveSelectionPreviewCount: Array.isArray(STATE.moveSelectionPreviewItems) ? STATE.moveSelectionPreviewItems.length : 0,
+      moveSelectionExpectedCount: Number(STATE.moveSelectionExpectedCount || 0),
+      moveSelectionSource: STATE.moveSelectionSource || 'visible',
+      moveSelectionWarning: STATE.moveSelectionWarning || '',
       lastEmptyDirScan: STATE.lastEmptyDirScan
         ? {
             rootParentId: STATE.lastEmptyDirScan.rootParentId,
@@ -6514,6 +7469,69 @@
     };
   }
 
+  async function verifyMovedItemsByList(targets, options = {}) {
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const taskControl = options.taskControl || null;
+    const maxRounds = Math.max(1, Number(options.maxRounds || 6));
+    const intervalMs = Math.max(300, Number(options.intervalMs || 1500));
+    const verifiedPageSize = Math.max(
+      Number(UI.fields.pageSize?.value || 0),
+      Number(CONFIG.request.manualListBody.pageSize || 0),
+      Number(getCapturedItems().length || 0),
+      Number((targets || []).length || 0) + 50,
+      200
+    );
+    const sourceTargets = Array.isArray(targets) ? targets.filter(Boolean) : [];
+    let remaining = sourceTargets.slice();
+    let movedItems = [];
+    let lastError = null;
+
+    for (let round = 1; round <= maxRounds; round += 1) {
+      await waitForTaskControl(taskControl);
+      try {
+        const items = await fetchCurrentList({ pageSize: verifiedPageSize, __returnBatchOnly: true });
+        const existingIds = new Set((items || []).map((item) => String(item.fileId)));
+        remaining = sourceTargets.filter((item) => existingIds.has(String(item.fileId)));
+        movedItems = sourceTargets.filter((item) => !existingIds.has(String(item.fileId)));
+
+        if (onProgress) {
+          onProgress({
+            visible: true,
+            percent: Math.min(99, 82 + (round / maxRounds) * 16),
+            indeterminate: false,
+            text: `任务状态未确认，正在刷新目录核对移动结果 | 已确认移走 ${movedItems.length}/${sourceTargets.length} | 第 ${round}/${maxRounds} 次`,
+          });
+        }
+
+        if (!remaining.length) {
+          return {
+            ok: true,
+            movedItems,
+            remaining: [],
+            rounds: round,
+            pageSize: verifiedPageSize,
+          };
+        }
+      } catch (err) {
+        lastError = err;
+        warn('移动结果核对时刷新目录失败：', err);
+      }
+
+      if (round < maxRounds) {
+        await controlledDelay(intervalMs, taskControl);
+      }
+    }
+
+    return {
+      ok: false,
+      movedItems,
+      remaining,
+      rounds: maxRounds,
+      pageSize: verifiedPageSize,
+      error: lastError,
+    };
+  }
+
   async function deleteDuplicateItems(options = {}) {
     const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
     const taskControl = options.taskControl || null;
@@ -7080,6 +8098,7 @@
       duplicateNumbers: CONFIG.duplicate.numbers || DEFAULT_DUPLICATE_NUMBERS,
       cloudBatchLimit: String(CONFIG.cloud.maxFilesPerTask || 500),
       cloudDirPrefix: CONFIG.cloud.sourceDirPrefix || '磁力导入',
+      moveTargetParentId: CONFIG.move.targetParentId || '',
       ruleSearchText: firstRule.type === 'text' ? (firstRule.search || '') : '',
       ruleReplaceText: firstRule.type === 'text' ? (firstRule.replace || '') : '',
       addText: output.addText || '',
@@ -7169,6 +8188,7 @@
     const cloudBatchLimit = Number(UI.fields.cloudBatchLimit?.value || 500);
     CONFIG.cloud.maxFilesPerTask = Number.isFinite(cloudBatchLimit) && cloudBatchLimit > 0 ? Math.max(1, cloudBatchLimit) : 500;
     CONFIG.cloud.sourceDirPrefix = (UI.fields.cloudDirPrefix?.value || '磁力导入').trim() || '磁力导入';
+    CONFIG.move.targetParentId = (UI.fields.moveTargetParentId?.value || '').trim();
 
     const delayMs = Number(UI.fields.delayMs?.value || 300);
     CONFIG.batch.delayMs = Number.isFinite(delayMs) && delayMs >= 0 ? delayMs : 300;
@@ -8041,24 +9061,9 @@
             <input data-field="startIndex" placeholder="0" />
           </label>
           <label class="gyp-field">
-            <span>重复项编号</span>
-            <input data-field="duplicateNumbers" placeholder="1,2,3" />
-            <div class="gyp-inline-help">只要名字最后带 (1)、(2)、(3) 就算重复。这里填 1,2,3 就行；想加 4 就写 1,2,3,4。</div>
-          </label>
-          <label class="gyp-field">
             <span>每次请求间隔毫秒</span>
             <input data-field="delayMs" placeholder="300" />
             <div class="gyp-inline-help">默认 300。如果接口容易失败，可以适当调大，比如 500 或 800。</div>
-          </label>
-          <label class="gyp-field">
-            <span>云添加每批最多文件数</span>
-            <input data-field="cloudBatchLimit" placeholder="500" />
-            <div class="gyp-inline-help">试用版限制一次最多 500 个文件。脚本会把单条磁力自动拆成多批 create_task。</div>
-          </label>
-          <label class="gyp-field">
-            <span>云添加目录前缀</span>
-            <input data-field="cloudDirPrefix" placeholder="磁力导入" />
-            <div class="gyp-inline-help">导入本地 txt 后，会在当前目录下建立“前缀-文本名-时间戳”文件夹，避免和现有内容混在一起。</div>
           </label>
           <div class="gyp-example">
             <div class="gyp-example-title">当前规则示例</div>
@@ -8085,50 +9090,6 @@
 2. “改名方式”才是最终要怎么命名，可选增加、替换、格式命名
 3. 现在的“最终名字格式”其实就是以前的高级模板概念，已经放到高级区里了
 4. 每次填完都看上面的示例，确认结果对了，再点“预览”或“执行改名”</div>
-          <details class="gyp-advanced" data-role="advanced-details">
-            <summary class="gyp-advanced-title">手动认证 / 高级兜底（一般不用）</summary>
-            <div class="gyp-inline-help">脚本默认优先使用刚刚自动捕获到的认证和目录上下文。只有自动抓不到时，才需要展开这里手填。</div>
-            <div class="gyp-config-actions">
-              <button type="button" class="secondary" data-action="fill-captured">刷新已捕获上下文</button>
-            </div>
-            <label class="gyp-field">
-              <span>Authorization</span>
-              <textarea data-field="authorization" placeholder="默认优先用最新自动识别；只有自动抓不到时才手填 Bearer ..."></textarea>
-            </label>
-            <label class="gyp-field">
-              <span>DID</span>
-              <input data-field="did" placeholder="默认自动识别；抓不到时再填" />
-            </label>
-            <label class="gyp-field">
-              <span>DT</span>
-              <input data-field="dt" placeholder="默认自动识别；抓不到时再填" />
-            </label>
-            <label class="gyp-field">
-              <span>parentId</span>
-              <input data-field="parentId" placeholder="当前目录 ID，平时自动识别；抓不到时再填" />
-            </label>
-            <label class="gyp-field">
-              <span>接口单次抓取数（兜底）</span>
-              <input data-field="pageSize" placeholder="默认 100；后续做累计抓取后会进一步隐藏" />
-            </label>
-            <label class="gyp-field">
-              <span>高级模板 template</span>
-              <input data-field="template" placeholder="比如：{clean} / {original} / 文件{index}" />
-              <div class="gyp-inline-help" data-role="output-template-group">只有“改名方式”选了“自定义模板（高级）”时才会用到这里。</div>
-            </label>
-            <label class="gyp-field">
-              <span>规则正则 pattern</span>
-              <input data-field="rulePattern" placeholder="只有在“预处理 = 自定义正则”时才需要填" />
-            </label>
-            <label class="gyp-field">
-              <span>规则 flags</span>
-              <input data-field="ruleFlags" placeholder="一般是 u" />
-            </label>
-            <label class="gyp-field">
-              <span>替换成 replace</span>
-              <input data-field="ruleReplace" placeholder="留空表示删除匹配到的内容" />
-            </label>
-          </details>
             </div>
           </details>
           <details class="gyp-section" data-role="duplicate-details">
@@ -8147,6 +9108,11 @@
                 <button type="button" class="secondary" data-action="select-duplicates">勾选重复项</button>
                 <button type="button" class="danger" data-action="delete-duplicates">删除重复项</button>
               </div>
+              <label class="gyp-field">
+                <span>重复项编号</span>
+                <input data-field="duplicateNumbers" placeholder="1,2,3" />
+                <div class="gyp-inline-help">这里只影响重复项识别规则。只要名字最后带 (1)、(2)、(3) 就算重复；想加 4 就写 1,2,3,4。</div>
+              </label>
               <div class="gyp-duplicate-panel">
                 <div class="gyp-duplicate-head">
                   <div class="gyp-duplicate-title">重复项列表</div>
@@ -8190,6 +9156,34 @@
               </div>
             </div>
           </details>
+          <details class="gyp-section" data-role="move-details">
+            <summary>
+              <span class="gyp-section-summary">
+                <span class="gyp-section-headline">
+                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">📦</span><span class="gyp-section-title">移动整理</span></span>
+                  <span class="gyp-section-desc">基于当前页面已勾选项做移动，不是面板里的勾选</span>
+                </span>
+                <span class="gyp-section-badge" data-role="move-count">当前勾选 0 项</span>
+              </span>
+            </summary>
+            <div class="gyp-section-body">
+              <div class="gyp-section-actions">
+                <button type="button" class="secondary" data-action="preview-move-selection">读取当前勾选</button>
+                <button type="button" class="secondary" data-action="move-selected-up-one-level">勾选项整体上移一层</button>
+                <button type="button" class="secondary" data-action="move-folder-contents-up">拆开文件夹内容到当前目录</button>
+                <button type="button" class="secondary" data-action="move-selected-to-target">勾选项移到目标目录</button>
+              </div>
+              <div class="gyp-section-note">这里读取的是云盘文件列表里当前页面已经勾选的文件 / 文件夹。“勾选项整体上移一层”会保留文件夹本身；“拆开文件夹内容到当前目录”会把文件夹里的直接内容提到当前目录，不保留外层文件夹，也不会自动删除空文件夹。</div>
+              <label class="gyp-field">
+                <span>目标目录 parentId</span>
+                <input data-field="moveTargetParentId" placeholder="要移动到哪个文件夹，就填那个目录的 parentId" />
+                <div class="gyp-inline-help">“勾选项移到目标目录”会把当前页面已勾选的文件 / 文件夹直接移动到这里。这个值会保存在本地。</div>
+              </label>
+              <div class="gyp-import-list" data-role="move-selection-list">
+                <div class="gyp-import-empty">点“读取当前勾选”后，这里会显示当前页面已勾选的文件 / 文件夹。</div>
+              </div>
+            </div>
+          </details>
           <details class="gyp-section" data-role="magnet-details">
             <summary>
               <span class="gyp-section-summary">
@@ -8207,17 +9201,80 @@
                 <button type="button" class="secondary" data-action="import-magnets">开始云添加</button>
                 <button type="button" class="secondary" data-action="list-cloud-tasks">查看云任务</button>
               </div>
+              <label class="gyp-field">
+                <span>云添加每批最多文件数</span>
+                <input data-field="cloudBatchLimit" placeholder="500" />
+                <div class="gyp-inline-help">这里只影响云添加的拆批数量。试用版常见限制是一次最多 500 个文件，脚本会按这里的值自动拆分 create_task。</div>
+              </label>
+              <label class="gyp-field">
+                <span>云添加目录前缀</span>
+                <input data-field="cloudDirPrefix" placeholder="磁力导入" />
+                <div class="gyp-inline-help">这里只影响云添加时自动创建的目录名。导入本地 txt/json 后，会建立“前缀-文本名-时间戳”文件夹，避免和现有内容混在一起。</div>
+              </label>
               <div class="gyp-import-list" data-role="magnet-file-list">
                 <div class="gyp-import-empty">选择包含 magnet 链接的 txt 或 json 文件后，脚本会自动识别并按每批 500 文件拆分云添加。</div>
               </div>
               <input type="file" accept=".txt,.json,.log,.text,.md" multiple hidden data-role="magnet-file-input" data-keep-enabled="true" />
             </div>
           </details>
+          <details class="gyp-section" data-role="advanced-details">
+            <summary>
+              <span class="gyp-section-summary">
+                <span class="gyp-section-headline">
+                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">🛠️</span><span class="gyp-section-title">高级与调试</span></span>
+                  <span class="gyp-section-desc">手动认证、模板/正则兜底和调试信息都放在最后</span>
+                </span>
+              </span>
+            </summary>
+            <div class="gyp-section-body">
+              <div class="gyp-section-note">脚本默认优先使用刚刚自动捕获到的认证和目录上下文。只有自动抓不到，或者你要用自定义模板 / 自定义正则时，再展开这里。</div>
+              <div class="gyp-config-actions">
+                <button type="button" class="secondary" data-action="fill-captured">刷新已捕获上下文</button>
+              </div>
+              <label class="gyp-field">
+                <span>Authorization</span>
+                <textarea data-field="authorization" placeholder="默认优先用最新自动识别；只有自动抓不到时才手填 Bearer ..."></textarea>
+              </label>
+              <label class="gyp-field">
+                <span>DID</span>
+                <input data-field="did" placeholder="默认自动识别；抓不到时再填" />
+              </label>
+              <label class="gyp-field">
+                <span>DT</span>
+                <input data-field="dt" placeholder="默认自动识别；抓不到时再填" />
+              </label>
+              <label class="gyp-field">
+                <span>parentId</span>
+                <input data-field="parentId" placeholder="当前目录 ID，平时自动识别；抓不到时再填" />
+              </label>
+              <label class="gyp-field">
+                <span>接口单次抓取数（兜底）</span>
+                <input data-field="pageSize" placeholder="默认 100；只有自动识别不到时才需要改" />
+              </label>
+              <label class="gyp-field">
+                <span>高级模板 template</span>
+                <input data-field="template" placeholder="比如：{clean} / {original} / 文件{index}" />
+                <div class="gyp-inline-help" data-role="output-template-group">只有“改名方式”选了“自定义模板（高级）”时才会用到这里。</div>
+              </label>
+              <label class="gyp-field">
+                <span>规则正则 pattern</span>
+                <input data-field="rulePattern" placeholder="只有在“预处理 = 自定义正则”时才需要填" />
+              </label>
+              <label class="gyp-field">
+                <span>规则 flags</span>
+                <input data-field="ruleFlags" placeholder="一般是 u" />
+              </label>
+              <label class="gyp-field">
+                <span>替换成 replace</span>
+                <input data-field="ruleReplace" placeholder="留空表示删除匹配到的内容" />
+              </label>
+              <details class="gyp-debug-details">
+                <summary>调试信息（一般不用）</summary>
+                <div class="gyp-summary" data-role="summary"></div>
+              </details>
+            </div>
+          </details>
         </div>
-        <details class="gyp-debug-details">
-          <summary>调试信息（一般不用）</summary>
-          <div class="gyp-summary" data-role="summary"></div>
-        </details>
       </div>
     `;
 
@@ -8236,6 +9293,9 @@
     UI.duplicateDetails = root.querySelector('[data-role="duplicate-details"]');
     UI.duplicateList = root.querySelector('[data-role="duplicate-list"]');
     UI.duplicateCount = root.querySelector('[data-role="duplicate-count"]');
+    UI.moveDetails = root.querySelector('[data-role="move-details"]');
+    UI.moveSelectionList = root.querySelector('[data-role="move-selection-list"]');
+    UI.moveSelectionCount = root.querySelector('[data-role="move-count"]');
     UI.emptyDirList = root.querySelector('[data-role="empty-dir-list"]');
     UI.emptyDirCount = root.querySelector('[data-role="empty-dir-count"]');
     UI.emptyDirDetails = root.querySelector('[data-role="empty-dir-details"]');
@@ -8265,6 +9325,7 @@
     UI.fields.duplicateNumbers = root.querySelector('[data-field="duplicateNumbers"]');
     UI.fields.cloudBatchLimit = root.querySelector('[data-field="cloudBatchLimit"]');
     UI.fields.cloudDirPrefix = root.querySelector('[data-field="cloudDirPrefix"]');
+    UI.fields.moveTargetParentId = root.querySelector('[data-field="moveTargetParentId"]');
     UI.fields.rulePattern = root.querySelector('[data-field="rulePattern"]');
     UI.fields.ruleFlags = root.querySelector('[data-field="ruleFlags"]');
     UI.fields.ruleReplace = root.querySelector('[data-field="ruleReplace"]');
@@ -8538,6 +9599,81 @@
           return;
         }
 
+        if (action === 'preview-move-selection') {
+          if (UI.moveDetails) {
+            UI.moveDetails.open = true;
+          }
+          setProgressBar({ visible: false });
+          const selection = await collectCheckedPageSelectionPreviewItems();
+          const items = selection.items || [];
+          setMoveSelectionPreview(items, selection.meta);
+          if (!items.length) {
+            updatePanelStatus('当前页面没有勾选任何文件或文件夹');
+          } else if (selection.meta?.partial) {
+            updatePanelStatus(selection.meta.warning || `页面显示已选 ${selection.meta?.expectedCount || 0} 项，但当前只识别到 ${selection.meta?.visibleCount || items.length} 项`);
+          } else {
+            updatePanelStatus(selection.meta?.warning || `已读取当前页面勾选 ${Math.max(items.length, Number(selection.meta?.expectedCount || 0))} 项`);
+          }
+          return;
+        }
+
+        if (action === 'move-folder-contents-up') {
+          if (UI.moveDetails) {
+            UI.moveDetails.open = true;
+          }
+          await runWithTaskControl('拆开文件夹内容到当前目录', async (taskControl) => {
+            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备读取已勾选文件夹内容...' });
+            const result = await moveCheckedFolderContentsToCurrentDirectory({
+              onProgress: (state) => setProgressBar(state),
+              taskControl,
+            });
+            updatePanelStatus(
+              result.fail
+                ? `拆开文件夹内容完成：成功 ${result.ok} 项，失败 ${result.fail} 项；读取文件夹 ${result.folders?.length || 0} 个`
+                : `拆开文件夹内容完成：成功 ${result.ok} 项，失败 ${result.fail} 项；读取文件夹 ${result.folders?.length || 0} 个；空文件夹不会自动删除`
+            );
+          });
+          return;
+        }
+
+        if (action === 'move-selected-up-one-level') {
+          if (UI.moveDetails) {
+            UI.moveDetails.open = true;
+          }
+          await runWithTaskControl('勾选项整体上移一层', async (taskControl) => {
+            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备把当前勾选项整体上移一层...' });
+            const result = await moveCheckedItemsUpOneLevel({
+              onProgress: (state) => setProgressBar(state),
+              taskControl,
+            });
+            updatePanelStatus(
+              result.fail
+                ? `勾选项整体上移一层完成：成功 ${result.ok} 项，失败 ${result.fail} 项；目标目录 ${result.targetParentId || '(未识别)'}`
+                : `勾选项整体上移一层完成：成功 ${result.ok} 项，失败 ${result.fail} 项；目标目录 ${result.targetParentId || '(未识别)'}`
+            );
+          });
+          return;
+        }
+
+        if (action === 'move-selected-to-target') {
+          if (UI.moveDetails) {
+            UI.moveDetails.open = true;
+          }
+          await runWithTaskControl('移动勾选项到目标目录', async (taskControl) => {
+            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备移动当前勾选项...' });
+            const result = await moveCheckedItemsToTargetDirectory({
+              onProgress: (state) => setProgressBar(state),
+              taskControl,
+            });
+            updatePanelStatus(
+              result.fail
+                ? `移动勾选项完成：成功 ${result.ok} 项，失败 ${result.fail} 项；目标目录 ${result.targetParentId || CONFIG.move.targetParentId || '(未识别)'}`
+                : `移动勾选项完成：成功 ${result.ok} 项，失败 ${result.fail} 项；目标目录 ${result.targetParentId || CONFIG.move.targetParentId || '(未识别)'}`
+            );
+          });
+          return;
+        }
+
         if (action === 'state') {
           setProgressBar({ visible: false });
           console.log(LOG_PREFIX, exportState());
@@ -8656,6 +9792,7 @@
 
     syncPanelFromConfig();
     renderDuplicatePreviewList();
+    renderMoveSelectionList();
     renderEmptyDirScanList();
     renderMagnetImportList();
     updateRenameModePreview();
@@ -9030,6 +10167,10 @@
         .catch((err) => fail('读取云添加任务失败：', err));
     });
 
+    GM_registerMenuCommand('光鸭云盘：读取当前页面勾选', () => {
+      console.table(buildCheckedPageSelectionPreviewItems());
+    });
+
     GM_registerMenuCommand('光鸭云盘：查看捕获状态', () => {
       console.log(LOG_PREFIX, exportState());
     });
@@ -9057,6 +10198,10 @@
     deleteEmptyDirItems,
     importMagnetTextFiles,
     listCloudTasks,
+    buildCheckedPageSelectionPreviewItems,
+    moveCheckedFolderContentsToCurrentDirectory,
+    moveCheckedItemsUpOneLevel,
+    moveCheckedItemsToTargetDirectory,
     scanEmptyLeafDirectories,
     extractMagnetLinks,
     applyPanelConfig,
