@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         光鸭云盘批量助手 V4
 // @namespace    serenalee.guangyapan.batch-helper
-// @version      0.5.41
+// @version      0.5.42
 // @description  为光鸭云盘网页端提供批量重命名、重复项清理、移动整理、磁力云添加、秒传 JSON 转换/诊断、空目录扫描与删除等功能。
 // @author       Serena Lee
 // @license      Copyright (c) 2026 Serena Lee. All rights reserved.
@@ -38,7 +38,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.5.41';
+  const SCRIPT_VERSION = '0.5.42';
 
   // =========================
   // 用户配置区：主要改这里
@@ -4185,7 +4185,8 @@
 
       let page = 1;
       let total = 0;
-      do {
+      let observedPageSize = 0;
+      while (page <= 50) {
         if (typeof options.onProgress === 'function') {
           options.onProgress({
             visible: true,
@@ -4197,6 +4198,7 @@
         const payload = await fetchQuarkShareDetailPage({ pwdId, stoken, pdirFid: dirFid, page, size: pageSize, cookie });
         const list = extractQuarkShareList(payload);
         total = extractQuarkShareTotal(payload);
+        observedPageSize = Math.max(observedPageSize, list.length || 0);
         captureMiaochuanSourcePayload(`quark-share:${pwdId}:${dirFid}:${page}`, { pdir_fid: dirFid, page }, payload);
 
         for (const item of list) {
@@ -4221,11 +4223,14 @@
           }
         }
 
-        if (!list.length || list.length < pageSize) {
+        const effectivePageSize = observedPageSize || pageSize;
+        const fetchedEnough = total > 0 && page * effectivePageSize >= total;
+        const likelyLastPageWithoutTotal = total <= 0 && page > 1 && list.length > 0 && list.length < effectivePageSize;
+        if (!list.length || fetchedEnough || likelyLastPageWithoutTotal) {
           break;
         }
         page += 1;
-      } while (total > 0 ? (page - 1) * pageSize < total : page <= 50);
+      }
     }
 
     const md5Map = rows.length
@@ -11166,7 +11171,7 @@
                 <button type="button" class="secondary" data-action="copy-miaochuan-report">复制报告</button>
                 <button type="button" class="secondary" data-action="clear-miaochuan-json">清空</button>
               </div>
-              <div class="gyp-section-note">优先用“从当前网页抓取生成”：脚本会捕获夸克 / 123 / 天翼 / 光鸭等页面加载文件列表时返回的数据，自动生成光鸭秒传 JSON。秒传不是上传文件：光鸭会用 MD5 + 大小查服务端库存；库里有才会秒传，库里没有就会显示未命中。</div>
+              <div class="gyp-section-note">优先用“从当前网页抓取生成”：脚本会捕获夸克 / 123 / 天翼 等页面加载文件列表时返回的数据，自动生成光鸭秒传 JSON。秒传不是上传文件：光鸭会用 MD5 + 大小查服务端库存；库里有才会秒传，库里没有就会显示未命中。</div>
               <div class="gyp-inline-help" data-role="miaochuan-captured-count">当前网页已捕获 0 条候选文件；请先让网盘列表加载完成。</div>
               <label class="gyp-field">
                 <span>夸克 Cookie（分享页主动取 MD5 时使用）</span>
