@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         光鸭云盘批量助手 V4
 // @namespace    serenalee.guangyapan.batch-helper
-// @version      0.5.42
+// @version      0.5.44
 // @description  为光鸭云盘网页端提供批量重命名、重复项清理、移动整理、磁力云添加、秒传 JSON 转换/诊断、空目录扫描与删除等功能。
 // @author       Serena Lee
 // @license      Copyright (c) 2026 Serena Lee. All rights reserved.
 // @match        https://pan.quark.cn/*
 // @match        https://drive.quark.cn/*
-// @match        https://cloud.189.cn/web/*
+// @match        https://cloud.189.cn/*
 // @match        *://*.123pan.com/*
 // @match        *://*.123pan.cn/*
 // @match        https://www.123pan.com/*
@@ -29,6 +29,12 @@
 // @connect      drive.quark.cn
 // @connect      drive-pc.quark.cn
 // @connect      pc-api.uc.cn
+// @connect      www.123pan.com
+// @connect      123pan.com
+// @connect      www.123pan.cn
+// @connect      123pan.cn
+// @connect      *.123pan.com
+// @connect      *.123pan.cn
 // @connect      cloud.189.cn
 // @connect      api.guangyapan.com
 // @downloadURL https://update.greasyfork.org/scripts/574046/%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98%E6%89%B9%E9%87%8F%E5%8A%A9%E6%89%8B%20V4.user.js
@@ -38,7 +44,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.5.42';
+  const SCRIPT_VERSION = '0.5.44';
 
   // =========================
   // 用户配置区：主要改这里
@@ -221,6 +227,9 @@
     lastCloudImportSummary: null,
     lastCloudTaskList: null,
     lastMiaochuanJsonResult: null,
+    shareLinkRows: [],
+    shareLinkSelection: {},
+    shareLinkMeta: null,
     miaochuanCapturedRows: [],
     miaochuanCapturedMap: {},
     lastMiaochuanCaptureAt: 0,
@@ -260,6 +269,10 @@
     magnetFileInput: null,
     magnetFileList: null,
     magnetFileCount: null,
+    shareLinkDetails: null,
+    shareLinkList: null,
+    shareLinkCount: null,
+    shareLinkSummary: null,
     miaochuanDetails: null,
     miaochuanFileInput: null,
     miaochuanDiagnosis: null,
@@ -3835,6 +3848,163 @@
     }
   }
 
+  function extractFirstUrlFromText(text = '') {
+    const matched = String(text || '').match(/https?:\/\/[^\s"'<>]+/iu);
+    return matched ? String(matched[0] || '').trim() : '';
+  }
+
+  function extractSharePasscodeFromText(text = '') {
+    const matched = String(text || '').match(/(?:提取码|访问码|密码|code|pwd|passcode)\s*[:：]?\s*([a-z0-9]{4,8})/iu);
+    return matched ? String(matched[1] || '').trim() : '';
+  }
+
+  function is123PanShareHost(host = '') {
+    return /(^|\.)123pan\.(com|cn)$/i.test(host)
+      || /(^|\.)123(865|684|912)\.com$/i.test(host);
+  }
+
+  function extract123PanShareKeyFromUrl(parsedUrl) {
+    if (!parsedUrl) {
+      return '';
+    }
+    const direct = parsedUrl.searchParams.get('shareKey')
+      || parsedUrl.searchParams.get('share_key')
+      || parsedUrl.searchParams.get('sharekey')
+      || '';
+    if (direct) {
+      return decodeUrlParam(direct).trim();
+    }
+    const pathname = decodeUrlParam(parsedUrl.pathname || '');
+    const matched = pathname.match(/\/(?:s|ps|123pan)\/([^/?#]+)/i)
+      || pathname.match(/\/([A-Za-z0-9][A-Za-z0-9_-]*-[A-Za-z0-9_-]+)(?:\/|$)/);
+    return matched ? String(matched[1] || '').trim() : '';
+  }
+
+  function extractTianyiShareCodeFromUrl(parsedUrl) {
+    if (!parsedUrl) {
+      return '';
+    }
+    const direct = parsedUrl.searchParams.get('shareCode')
+      || parsedUrl.searchParams.get('share_code')
+      || parsedUrl.searchParams.get('code')
+      || '';
+    if (direct) {
+      return decodeUrlParam(direct).trim();
+    }
+    const href = parsedUrl.href || '';
+    const queryMatched = href.match(/[?&#](?:shareCode|share_code|code)=([^&#]+)/i);
+    if (queryMatched) {
+      return decodeUrlParam(queryMatched[1]).trim();
+    }
+    const pathMatched = decodeUrlParam(parsedUrl.pathname || '').match(/\/t\/([^/?#]+)/i);
+    return pathMatched ? String(pathMatched[1] || '').trim() : '';
+  }
+
+  function detectShareLinkProvider(rawInput = '', options = {}) {
+    const text = String(rawInput || '').trim();
+    const manualPasscode = String(options.manualPasscode || '').trim();
+    const urlText = extractFirstUrlFromText(text) || text;
+    if (!urlText) {
+      return {
+        provider: '',
+        label: '',
+        supported: false,
+        shareUrl: '',
+        passcode: manualPasscode || '',
+        message: '请先粘贴分享链接。',
+      };
+    }
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(urlText);
+    } catch {
+      return {
+        provider: '',
+        label: '',
+        supported: false,
+        shareUrl: urlText,
+        passcode: manualPasscode || '',
+        message: '分享链接格式不正确，请粘贴完整的 http(s) 链接。',
+      };
+    }
+
+    const host = String(parsedUrl.hostname || '').toLowerCase();
+    const passcode = manualPasscode
+      || parsedUrl.searchParams.get('pwd')
+      || parsedUrl.searchParams.get('passcode')
+      || parsedUrl.searchParams.get('accessCode')
+      || parsedUrl.searchParams.get('access_code')
+      || parsedUrl.searchParams.get('pickupCode')
+      || parsedUrl.searchParams.get('pickup_code')
+      || extractSharePasscodeFromText(text);
+
+    if (/(^|\.)quark\.cn$/i.test(host)) {
+      const matched = parsedUrl.pathname.match(/\/s\/([^/?#]+)/i);
+      const pwdId = matched ? decodeUrlParam(matched[1]) : '';
+      return {
+        provider: 'quark',
+        label: '夸克网盘分享链接',
+        supported: Boolean(pwdId),
+        shareUrl: parsedUrl.toString(),
+        passcode: String(passcode || '').trim(),
+        pwdId,
+        message: pwdId ? '' : '没有在链接里识别到夸克分享 ID。',
+      };
+    }
+
+    if (is123PanShareHost(host)) {
+      const shareKey = extract123PanShareKeyFromUrl(parsedUrl);
+      return {
+        provider: '123pan',
+        label: '123 网盘分享链接',
+        supported: Boolean(shareKey),
+        shareUrl: parsedUrl.toString(),
+        passcode: String(passcode || '').trim(),
+        shareKey,
+        message: shareKey ? '' : '没有在链接里识别到 123 网盘分享 Key。',
+      };
+    }
+
+    if (/cloud\.189\.cn$/i.test(host)) {
+      const shareCode = extractTianyiShareCodeFromUrl(parsedUrl);
+      return {
+        provider: 'tianyiyun',
+        label: '天翼云盘分享链接',
+        supported: Boolean(shareCode),
+        shareUrl: parsedUrl.toString(),
+        passcode: String(passcode || '').trim(),
+        shareCode,
+        message: shareCode ? '' : '没有在链接里识别到天翼云盘分享 Code。',
+      };
+    }
+
+    return {
+      provider: 'unknown',
+      label: host || '未知来源',
+      supported: false,
+      shareUrl: parsedUrl.toString(),
+      passcode: String(passcode || '').trim(),
+      message: `暂未识别或支持这个分享链接来源：${host || '未知域名'}` ,
+    };
+  }
+
+  function getShareLinkQuarkCookie() {
+    const manual = String(UI.fields.shareLinkQuarkCookie?.value || '').trim();
+    if (manual) {
+      setStoredQuarkCookie(manual);
+      return manual;
+    }
+    if (UI.fields.miaochuanQuarkCookie && UI.fields.miaochuanQuarkCookie.value) {
+      const fromMiaochuan = String(UI.fields.miaochuanQuarkCookie.value || '').trim();
+      if (fromMiaochuan) {
+        setStoredQuarkCookie(fromMiaochuan);
+        return fromMiaochuan;
+      }
+    }
+    return getQuarkCookieForMiaochuan();
+  }
+
   function quarkApiUrl(path, params = {}) {
     const url = new URL(`https://drive-pc.quark.cn${path}`);
     const baseParams = {
@@ -3917,6 +4087,423 @@
         reject(new Error(`${getErrorText(err) || '秒传接口调用失败'} | ${method} ${url}`));
       }
     });
+  }
+
+  function setMiaochuanCapturedRowsFromShareRows(rows, sourceKey) {
+    const list = Array.isArray(rows) ? rows : [];
+    STATE.miaochuanCapturedRows = list;
+    STATE.miaochuanCapturedMap = {};
+    list.forEach((row) => {
+      STATE.miaochuanCapturedMap[getMiaochuanCandidateKey(row)] = row;
+    });
+    STATE.lastMiaochuanCaptureAt = Date.now();
+    STATE.lastMiaochuanCaptureUrl = sourceKey || 'share-link';
+    renderMiaochuanCaptureStatus();
+    return list;
+  }
+
+  function get123PanRequestHeaders(shareKey = '', options = {}) {
+    const headers = {
+      Accept: 'application/json, text/plain, */*',
+      Referer: shareKey ? `https://www.123pan.com/s/${encodeURIComponent(shareKey)}` : 'https://www.123pan.com/',
+      Origin: 'https://www.123pan.com',
+      Platform: 'web',
+      'App-Version': '3',
+      ...(options.json === false ? {} : { 'Content-Type': 'application/json;charset=UTF-8' }),
+      ...(options.extra || {}),
+    };
+    return headers;
+  }
+
+  function get123PanItemName(item) {
+    return chooseBestNameCandidate([
+      item?.FileName,
+      item?.filename,
+      item?.fileName,
+      item?.Name,
+      item?.name,
+    ]);
+  }
+
+  function get123PanItemId(item) {
+    return String(item?.FileId ?? item?.fileId ?? item?.id ?? item?.Id ?? '').trim();
+  }
+
+  function get123PanItemSize(item) {
+    const size = normalizeMiaochuanInteger(item?.Size ?? item?.BaseSize ?? item?.LiveSize ?? item?.size ?? item?.fileSize);
+    return size == null ? 0 : size;
+  }
+
+  function is123PanDirectoryItem(item) {
+    if (!item || typeof item !== 'object') {
+      return false;
+    }
+    const type = item.Type ?? item.type ?? item.FileType ?? item.fileType;
+    if (String(type) === '1') {
+      return true;
+    }
+    const bool = normalizeBooleanish(item.isFolder ?? item.IsFolder ?? item.dir ?? item.is_dir);
+    if (bool != null) {
+      return bool;
+    }
+    const typeText = String(item.kind ?? item.categoryText ?? item.ContentType ?? '').toLowerCase();
+    return /folder|directory|dir/u.test(typeText);
+  }
+
+  function extract123PanShareList(payload) {
+    const data = payload && typeof payload === 'object' ? (payload.data || payload.Data || payload) : {};
+    const list = data.InfoList || data.infoList || data.list || data.items || [];
+    return Array.isArray(list) ? list : [];
+  }
+
+  function extract123PanShareNext(payload) {
+    const data = payload && typeof payload === 'object' ? (payload.data || payload.Data || payload) : {};
+    return String(data.Next ?? data.next ?? data.NextPage ?? data.nextPage ?? '').trim();
+  }
+
+  async function fetch123PanShareGetPage({ shareKey, parentFileId = '0', page = 1, next = '0', limit = 100, passcode = '' }) {
+    const url = new URL('https://www.123pan.com/b/api/share/get');
+    const params = {
+      limit,
+      next,
+      orderBy: 'share_id',
+      orderDirection: 'desc',
+      shareKey,
+      ParentFileId: parentFileId || '0',
+      Page: page,
+      operateType: 1,
+    };
+    if (passcode) {
+      params.SharePwd = passcode;
+    }
+    Object.entries(params).forEach(([key, value]) => {
+      if (value != null && String(value) !== '') {
+        url.searchParams.set(key, String(value));
+      }
+    });
+    const response = await requestMiaochuanJson(url.toString(), {
+      method: 'GET',
+      headers: get123PanRequestHeaders(shareKey, { json: false }),
+      timeout: 45000,
+    });
+    const code = response.payload && typeof response.payload === 'object' ? String(response.payload.code ?? response.payload.Code ?? '0') : '0';
+    if (!response.ok || code !== '0') {
+      const passwordHint = passcode ? '' : '；如果这个分享需要提取码，请填入提取码后重试';
+      throw new Error(`123 网盘目录读取失败：${getErrorText(response.payload || response.text || `HTTP ${response.status}`)}${passwordHint}`);
+    }
+    return response.payload;
+  }
+
+  async function fetch123PanShareRowsFromShareInfo(shareInfo = {}, options = {}) {
+    const shareKey = String(shareInfo.shareKey || '').trim();
+    if (!shareKey) {
+      throw new Error('没有拿到 123 网盘分享 Key。');
+    }
+    const passcode = String(shareInfo.passcode || '').trim();
+    const rows = [];
+    const queue = [{ fileId: '0', path: '' }];
+    const visited = new Set();
+    const pageSize = 100;
+    const maxDirs = 800;
+    const maxFiles = 50000;
+
+    while (queue.length) {
+      const current = queue.shift();
+      const dirId = String(current.fileId || '0');
+      const visitKey = `${dirId}:${current.path || ''}`;
+      if (visited.has(visitKey)) {
+        continue;
+      }
+      visited.add(visitKey);
+      if (visited.size > maxDirs) {
+        throw new Error(`123 网盘目录过多，已超过安全上限 ${maxDirs} 个目录。请进入更小的子目录后再生成。`);
+      }
+
+      let page = 1;
+      let next = '0';
+      while (page <= 500) {
+        if (typeof options.onProgress === 'function') {
+          options.onProgress({
+            visible: true,
+            percent: 0,
+            indeterminate: true,
+            text: `正在读取 123 网盘目录：${current.path || '/'} | 已收集 ${rows.length} 个文件`,
+          });
+        }
+        const payload = await fetch123PanShareGetPage({
+          shareKey,
+          parentFileId: dirId,
+          page,
+          next,
+          limit: pageSize,
+          passcode,
+        });
+        const list = extract123PanShareList(payload);
+        captureMiaochuanSourcePayload(`123pan-share:${shareKey}:${dirId}:${page}`, { ParentFileId: dirId, Page: page, next }, payload);
+
+        for (const item of list) {
+          const name = sanitizeCloudDirName(get123PanItemName(item), '未命名');
+          const itemPath = `${current.path}/${name}`.replace(/\/{2,}/g, '/');
+          if (is123PanDirectoryItem(item)) {
+            const fileId = get123PanItemId(item);
+            if (fileId) {
+              queue.push({ fileId, path: itemPath });
+            }
+            continue;
+          }
+          const etag = normalizeMiaochuanMd5(item?.Etag || item?.etag || item?.MD5 || item?.md5 || item?.Hash || item?.hash || '');
+          rows.push({
+            path: itemPath,
+            etag,
+            size: String(get123PanItemSize(item)),
+            __gypSource: '123pan-share-active',
+            __gypProvider: '123pan',
+            __gypFileId: get123PanItemId(item),
+            __gypHasMd5: Boolean(etag),
+          });
+          if (rows.length > maxFiles) {
+            throw new Error(`123 网盘文件过多，已超过安全上限 ${maxFiles} 个文件。请进入更小的子目录后再生成。`);
+          }
+        }
+
+        const nextValue = extract123PanShareNext(payload);
+        if (!list.length || !nextValue || nextValue === '-1') {
+          break;
+        }
+        if (nextValue === next && list.length < pageSize) {
+          break;
+        }
+        next = nextValue;
+        page += 1;
+      }
+    }
+
+    setMiaochuanCapturedRowsFromShareRows(rows, `123pan-share:${shareKey}`);
+    return rows;
+  }
+
+  function getTianyiRequestHeaders(shareCode = '', options = {}) {
+    return {
+      Accept: 'application/json;charset=UTF-8',
+      Referer: shareCode ? `https://cloud.189.cn/web/share?code=${encodeURIComponent(shareCode)}` : 'https://cloud.189.cn/web/',
+      Origin: 'https://cloud.189.cn',
+      'Sign-Type': '1',
+      ...(options.form ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
+      ...(options.extra || {}),
+    };
+  }
+
+  function assertTianyiSuccess(response, action) {
+    const payload = response.payload;
+    const code = payload && typeof payload === 'object' ? String(payload.res_code ?? payload.resCode ?? payload.code ?? '0') : '0';
+    if (!response.ok || code !== '0') {
+      throw new Error(`${action}失败：${getErrorText(payload || response.text || `HTTP ${response.status}`)}`);
+    }
+    return payload && typeof payload === 'object' ? payload : {};
+  }
+
+  function getTianyiItemName(item) {
+    return chooseBestNameCandidate([
+      item?.name,
+      item?.fileName,
+      item?.filename,
+      item?.file_name,
+    ]);
+  }
+
+  function getTianyiItemId(item) {
+    return String(item?.id ?? item?.fileId ?? item?.fileID ?? item?.file_id ?? '').trim();
+  }
+
+  function getTianyiItemSize(item) {
+    const size = normalizeMiaochuanInteger(item?.size ?? item?.fileSize ?? item?.file_size ?? item?.bytes);
+    return size == null ? 0 : size;
+  }
+
+  async function fetchTianyiShareInfo(shareCode) {
+    const body = new URLSearchParams({ shareCode }).toString();
+    const response = await requestMiaochuanJson('https://cloud.189.cn/api/open/share/getShareInfoByCodeV2.action', {
+      method: 'POST',
+      headers: getTianyiRequestHeaders(shareCode, { form: true }),
+      body,
+      timeout: 45000,
+    });
+    return assertTianyiSuccess(response, '天翼云盘分享信息读取');
+  }
+
+  async function fetchTianyiShareId({ shareCode, passcode = '', shareInfo = {} }) {
+    const direct = String(shareInfo.shareId ?? shareInfo.shareID ?? shareInfo.ShareId ?? '').trim();
+    if (direct) {
+      return direct;
+    }
+    const needAccessCode = String(shareInfo.needAccessCode ?? shareInfo.need_access_code ?? '') === '1'
+      || shareInfo.needAccessCode === true;
+    const accessCode = String(passcode || shareInfo.accessCode || shareInfo.access_code || '').trim();
+    if (needAccessCode && !accessCode) {
+      throw new Error('这个天翼云盘分享需要访问码，请填写访问码后重试。');
+    }
+    const url = new URL('https://cloud.189.cn/api/open/share/checkAccessCode.action');
+    url.searchParams.set('shareCode', shareCode);
+    url.searchParams.set('accessCode', accessCode);
+    const response = await requestMiaochuanJson(url.toString(), {
+      method: 'GET',
+      headers: getTianyiRequestHeaders(shareCode, { json: false }),
+      timeout: 45000,
+    });
+    const payload = assertTianyiSuccess(response, '天翼云盘访问码校验');
+    const shareId = String(payload.shareId ?? payload.shareID ?? payload.data?.shareId ?? '').trim();
+    if (!shareId) {
+      throw new Error('天翼云盘访问码校验成功，但没有返回 shareId。');
+    }
+    return shareId;
+  }
+
+  async function fetchTianyiShareDirPage({ shareCode, shareId, shareMode = 1, fileId, pageNum = 1, pageSize = 100, accessCode = '' }) {
+    const url = new URL('https://cloud.189.cn/api/open/share/listShareDir.action');
+    const params = {
+      pageNum,
+      pageSize,
+      fileId,
+      shareDirFileId: fileId,
+      isFolder: true,
+      shareId,
+      shareMode: shareMode || 1,
+      iconOption: 5,
+      orderBy: 'lastOpTime',
+      descending: true,
+      accessCode,
+    };
+    Object.entries(params).forEach(([key, value]) => {
+      if (value != null && String(value) !== '') {
+        url.searchParams.set(key, String(value));
+      }
+    });
+    const response = await requestMiaochuanJson(url.toString(), {
+      method: 'GET',
+      headers: getTianyiRequestHeaders(shareCode, { json: false }),
+      timeout: 45000,
+    });
+    return assertTianyiSuccess(response, '天翼云盘目录读取');
+  }
+
+  function extractTianyiFileListAO(payload) {
+    const root = payload && typeof payload === 'object' ? (payload.fileListAO || payload.data?.fileListAO || payload.data || payload) : {};
+    return root && typeof root === 'object' ? root : {};
+  }
+
+  async function fetchTianyiShareRowsFromShareInfo(shareInfo = {}, options = {}) {
+    const shareCode = String(shareInfo.shareCode || '').trim();
+    if (!shareCode) {
+      throw new Error('没有拿到天翼云盘分享 Code。');
+    }
+    const passcode = String(shareInfo.passcode || '').trim();
+    const infoPayload = await fetchTianyiShareInfo(shareCode);
+    const info = infoPayload.data && typeof infoPayload.data === 'object' ? infoPayload.data : infoPayload;
+    const shareId = await fetchTianyiShareId({ shareCode, passcode, shareInfo: info });
+    const accessCode = String(passcode || info.accessCode || info.access_code || '').trim();
+    const shareMode = normalizeMiaochuanInteger(info.shareMode ?? info.share_mode) || 1;
+    const shareName = sanitizeCloudDirName(info.fileName || info.name || '天翼云盘分享', '天翼云盘分享');
+    const rows = [];
+    const isRootFolder = normalizeBooleanish(info.isFolder ?? info.is_folder);
+    if (isRootFolder === false) {
+      const etag = normalizeMiaochuanMd5(info.md5 || info.fileMd5 || info.file_md5 || info.etag || '');
+      const filePath = `/${shareName}`.replace(/\/{2,}/g, '/');
+      rows.push({
+        path: filePath,
+        etag,
+        size: String(getTianyiItemSize(info)),
+        __gypSource: 'tianyiyun-share-active',
+        __gypProvider: 'tianyiyun',
+        __gypFileId: getTianyiItemId(info) || String(info.fileId || ''),
+        __gypHasMd5: Boolean(etag),
+      });
+      setMiaochuanCapturedRowsFromShareRows(rows, `tianyiyun-share:${shareCode}`);
+      return rows;
+    }
+
+    const rootFileId = String(info.fileId ?? info.id ?? '').trim();
+    if (!rootFileId) {
+      throw new Error('天翼云盘分享信息里没有根目录 fileId。');
+    }
+    const queue = [{ fileId: rootFileId, path: `/${shareName}`.replace(/\/{2,}/g, '/') }];
+    const visited = new Set();
+    const pageSize = 100;
+    const maxDirs = 800;
+    const maxFiles = 50000;
+
+    while (queue.length) {
+      const current = queue.shift();
+      const dirId = String(current.fileId || '');
+      if (!dirId || visited.has(dirId)) {
+        continue;
+      }
+      visited.add(dirId);
+      if (visited.size > maxDirs) {
+        throw new Error(`天翼云盘目录过多，已超过安全上限 ${maxDirs} 个目录。请进入更小的子目录后再生成。`);
+      }
+
+      let pageNum = 1;
+      while (pageNum <= 500) {
+        if (typeof options.onProgress === 'function') {
+          options.onProgress({
+            visible: true,
+            percent: 0,
+            indeterminate: true,
+            text: `正在读取天翼云盘目录：${current.path || '/'} | 已收集 ${rows.length} 个文件`,
+          });
+        }
+        const payload = await fetchTianyiShareDirPage({
+          shareCode,
+          shareId,
+          shareMode,
+          fileId: dirId,
+          pageNum,
+          pageSize,
+          accessCode,
+        });
+        const fileListAO = extractTianyiFileListAO(payload);
+        const folders = Array.isArray(fileListAO.folderList) ? fileListAO.folderList : [];
+        const files = Array.isArray(fileListAO.fileList) ? fileListAO.fileList : [];
+        const total = normalizeMiaochuanInteger(fileListAO.count ?? fileListAO.total ?? fileListAO.totalCount) || 0;
+        captureMiaochuanSourcePayload(`tianyiyun-share:${shareCode}:${dirId}:${pageNum}`, { fileId: dirId, pageNum }, payload);
+
+        for (const folder of folders) {
+          const name = sanitizeCloudDirName(getTianyiItemName(folder), '未命名');
+          const fileId = getTianyiItemId(folder);
+          if (fileId) {
+            queue.push({
+              fileId,
+              path: `${current.path}/${name}`.replace(/\/{2,}/g, '/'),
+            });
+          }
+        }
+        for (const file of files) {
+          const name = sanitizeCloudDirName(getTianyiItemName(file), '未命名');
+          const etag = normalizeMiaochuanMd5(file?.md5 || file?.fileMd5 || file?.file_md5 || file?.etag || '');
+          rows.push({
+            path: `${current.path}/${name}`.replace(/\/{2,}/g, '/'),
+            etag,
+            size: String(getTianyiItemSize(file)),
+            __gypSource: 'tianyiyun-share-active',
+            __gypProvider: 'tianyiyun',
+            __gypFileId: getTianyiItemId(file),
+            __gypHasMd5: Boolean(etag),
+          });
+          if (rows.length > maxFiles) {
+            throw new Error(`天翼云盘文件过多，已超过安全上限 ${maxFiles} 个文件。请进入更小的子目录后再生成。`);
+          }
+        }
+
+        const itemCount = folders.length + files.length;
+        if (!itemCount || (total > 0 && pageNum * pageSize >= total) || itemCount < pageSize) {
+          break;
+        }
+        pageNum += 1;
+      }
+    }
+
+    setMiaochuanCapturedRowsFromShareRows(rows, `tianyiyun-share:${shareCode}`);
+    return rows;
   }
 
   function extractQuarkStoken(payload) {
@@ -4157,13 +4744,13 @@
     return map;
   }
 
-  async function fetchQuarkShareRowsFromCurrentPage(options = {}) {
-    const pwdId = getQuarkSharePwdIdFromLocation();
+  async function fetchQuarkShareRowsFromShareInfo(shareInfo = {}, options = {}) {
+    const pwdId = String(shareInfo.pwdId || '').trim();
     if (!pwdId) {
-      throw new Error('当前页面不是夸克分享链接，无法解析 /s/ 后面的分享 ID。');
+      throw new Error('没有拿到夸克分享 ID。');
     }
-    const cookie = getQuarkCookieForMiaochuan();
-    const passcode = getQuarkSharePasscodeFromLocation();
+    const cookie = String(shareInfo.cookie || '').trim();
+    const passcode = String(shareInfo.passcode || '').trim();
     const stoken = await getQuarkShareToken(pwdId, passcode, cookie);
     const rows = [];
     const queue = [{ fid: '0', path: '' }];
@@ -4249,6 +4836,7 @@
         etag,
         size: String(getQuarkItemSize(row)),
         __gypSource: row.__gypSource,
+        __gypProvider: 'quark',
         __gypFid: fid,
         __gypHasMd5: Boolean(etag),
       };
@@ -4263,6 +4851,18 @@
     STATE.lastMiaochuanCaptureUrl = `quark-share:${pwdId}`;
     renderMiaochuanCaptureStatus();
     return enrichedRows;
+  }
+
+  async function fetchQuarkShareRowsFromCurrentPage(options = {}) {
+    const pwdId = getQuarkSharePwdIdFromLocation();
+    if (!pwdId) {
+      throw new Error('当前页面不是夸克分享链接，无法解析 /s/ 后面的分享 ID。');
+    }
+    return fetchQuarkShareRowsFromShareInfo({
+      pwdId,
+      passcode: getQuarkSharePasscodeFromLocation(),
+      cookie: getQuarkCookieForMiaochuan(),
+    }, options);
   }
 
 
@@ -4295,6 +4895,14 @@
     const labels = [];
     const notes = [];
     const blockers = [];
+    const topSource = [payload?.source, payload?.platform, payload?.provider].filter(Boolean).join(' ').toLowerCase();
+
+    if (/quark|夸克/u.test(topSource)) {
+      labels.push('夸克网盘');
+      if (/链接|直读|share/u.test(topSource)) {
+        notes.push('来源由夸克分享链接直读生成；工具已递归读取目录并尽量补齐真实 MD5。');
+      }
+    }
 
     if (has('etag') && has('files')) {
       labels.push('光鸭/通用秒传 JSON');
@@ -4648,6 +5256,175 @@
     };
   }
 
+  function getShareLinkInputText() {
+    return String(UI.fields.shareLinkUrl?.value || '').trim();
+  }
+
+  function getShareLinkPasscodeText() {
+    return String(UI.fields.shareLinkPasscode?.value || '').trim();
+  }
+
+  function getShareLinkRowKey(row) {
+    return [row?.path || '', row?.etag || '', row?.size || ''].join('__');
+  }
+
+  function getSelectedShareLinkRows() {
+    const rows = Array.isArray(STATE.shareLinkRows) ? STATE.shareLinkRows : [];
+    return rows.filter((row) => STATE.shareLinkSelection[getShareLinkRowKey(row)] !== false);
+  }
+
+  function renderShareLinkList() {
+    if (!UI.shareLinkList || !UI.shareLinkCount || !UI.shareLinkSummary) {
+      return;
+    }
+
+    const rows = Array.isArray(STATE.shareLinkRows) ? STATE.shareLinkRows : [];
+    const meta = STATE.shareLinkMeta || {};
+    const selectedRows = getSelectedShareLinkRows();
+    const readyCount = rows.filter((row) => Boolean(normalizeMiaochuanMd5(row?.etag || ''))).length;
+    const totalSize = rows.reduce((sum, row) => sum + Number(normalizeMiaochuanInteger(row?.size) || 0), 0);
+
+    UI.shareLinkCount.textContent = `已选 ${selectedRows.length}/${rows.length}`;
+    UI.shareLinkSummary.textContent = rows.length
+      ? `${meta.label || '分享链接'} | 文件 ${rows.length} 项 | 已就绪 MD5 ${readyCount} 项 | 总大小 ${formatMiaochuanBytes(totalSize)}`
+      : (meta.message || '粘贴分享链接后，先点“读取链接目录”，这里会显示可勾选的文件清单。');
+
+    if (!rows.length) {
+      UI.shareLinkList.innerHTML = `<div class="gyp-import-empty">${escapeHtml(meta.message || '粘贴分享链接后，先点“读取链接目录”，这里会显示可勾选的文件清单。')}</div>`;
+      return;
+    }
+
+    UI.shareLinkList.innerHTML = rows.map((row) => {
+      const key = getShareLinkRowKey(row);
+      const checked = STATE.shareLinkSelection[key] !== false;
+      const path = String(row?.path || '');
+      const sizeText = formatMiaochuanBytes(normalizeMiaochuanInteger(row?.size) || 0);
+      const md5 = normalizeMiaochuanMd5(row?.etag || '');
+      return `
+        <label class="gyp-empty-dir-row">
+          <input type="checkbox" data-action="toggle-share-link-file" data-share-link-key="${escapeHtml(key)}" ${checked ? 'checked' : ''} />
+          <div class="gyp-empty-dir-main">
+            <div class="gyp-empty-dir-path" title="${escapeHtml(path)}">${escapeHtml(path)}</div>
+            <div class="gyp-empty-dir-meta">${escapeHtml(sizeText)} | ${md5 ? `MD5: ${escapeHtml(md5)}` : 'MD5 未拿到，导入时会被跳过'}</div>
+          </div>
+        </label>
+      `;
+    }).join('');
+  }
+
+  function setShareLinkRows(rows = [], meta = {}) {
+    const normalizedRows = Array.isArray(rows) ? rows.filter((row) => row && typeof row === 'object') : [];
+    const previous = STATE.shareLinkSelection || {};
+    STATE.shareLinkRows = normalizedRows;
+    STATE.shareLinkMeta = { ...meta, loadedAt: Date.now() };
+    STATE.shareLinkSelection = {};
+    normalizedRows.forEach((row) => {
+      const key = getShareLinkRowKey(row);
+      STATE.shareLinkSelection[key] = Object.prototype.hasOwnProperty.call(previous, key) ? previous[key] !== false : true;
+    });
+    renderShareLinkList();
+  }
+
+  function clearShareLinkPanel() {
+    STATE.shareLinkRows = [];
+    STATE.shareLinkSelection = {};
+    STATE.shareLinkMeta = null;
+    renderShareLinkList();
+    updatePanelStatus('已清空分享直读结果');
+  }
+
+  function setAllShareLinkSelection(checked) {
+    const rows = Array.isArray(STATE.shareLinkRows) ? STATE.shareLinkRows : [];
+    rows.forEach((row) => {
+      STATE.shareLinkSelection[getShareLinkRowKey(row)] = Boolean(checked);
+    });
+    renderShareLinkList();
+  }
+
+  async function readShareLinkFromPanel(options = {}) {
+    const detected = detectShareLinkProvider(getShareLinkInputText(), {
+      manualPasscode: getShareLinkPasscodeText(),
+    });
+    if (UI.fields.shareLinkPasscode && detected.passcode && !UI.fields.shareLinkPasscode.value) {
+      UI.fields.shareLinkPasscode.value = detected.passcode;
+    }
+    if (!detected.supported) {
+      setShareLinkRows([], detected);
+      throw new Error(detected.message || '暂不支持这个分享链接。');
+    }
+
+    if (detected.provider === 'quark') {
+      const rows = await fetchQuarkShareRowsFromShareInfo({
+        pwdId: detected.pwdId,
+        passcode: detected.passcode,
+        cookie: getShareLinkQuarkCookie(),
+      }, options);
+      setShareLinkRows(rows, detected);
+      updatePanelStatus(`已读取 ${detected.label}：文件 ${rows.length} 项`);
+      return rows;
+    }
+
+    if (detected.provider === '123pan') {
+      const rows = await fetch123PanShareRowsFromShareInfo({
+        shareKey: detected.shareKey,
+        passcode: detected.passcode,
+      }, options);
+      setShareLinkRows(rows, detected);
+      updatePanelStatus(`已读取 ${detected.label}：文件 ${rows.length} 项`);
+      return rows;
+    }
+
+    if (detected.provider === 'tianyiyun') {
+      const rows = await fetchTianyiShareRowsFromShareInfo({
+        shareCode: detected.shareCode,
+        passcode: detected.passcode,
+      }, options);
+      setShareLinkRows(rows, detected);
+      updatePanelStatus(`已读取 ${detected.label}：文件 ${rows.length} 项`);
+      return rows;
+    }
+
+    setShareLinkRows([], detected);
+    throw new Error(detected.message || '暂不支持这个分享链接。');
+  }
+
+  function buildShareLinkMiaochuanSourcePayload(rows) {
+    const meta = STATE.shareLinkMeta || {};
+    return {
+      source: meta.label ? `${meta.label} 直读结果` : '分享链接直读结果',
+      provider: meta.provider || '',
+      shareUrl: meta.shareUrl || '',
+      capturedAt: new Date().toISOString(),
+      files: rows,
+    };
+  }
+
+  function generateMiaochuanJsonFromShareLinkSelection() {
+    const rows = getSelectedShareLinkRows();
+    if (!rows.length) {
+      throw new Error('当前没有勾选任何可生成的文件。请先读取分享链接，并至少勾选 1 项。');
+    }
+    const sourcePayload = buildShareLinkMiaochuanSourcePayload(rows);
+    const sourceText = JSON.stringify(sourcePayload, null, 2);
+    if (UI.fields.miaochuanJsonInput) {
+      UI.fields.miaochuanJsonInput.value = sourceText;
+    }
+    const result = normalizeMiaochuanPayload(sourceText, {
+      decodeHtml: true,
+      stripLeadingSlash: false,
+      sizeAsNumber: false,
+      sortByPath: true,
+      importLogText: getMiaochuanImportLogText(),
+    });
+    renderMiaochuanJsonResult(result);
+    updatePanelStatus(
+      result.errors.length
+        ? `已按勾选结果生成：可导入 ${result.normalized.files.length} 项，另有 ${result.errors.length} 项字段不完整`
+        : `已按勾选结果生成光鸭 JSON：${result.normalized.files.length} 项，${result.normalized.formattedTotalSize}`
+    );
+    return result;
+  }
+
   function renderMiaochuanJsonResult(result) {
     STATE.lastMiaochuanJsonResult = result || null;
     if (UI.miaochuanOutput) {
@@ -4847,8 +5624,8 @@
     return `${CONFIG.request.apiHost}/nd.bizuserres.s/v1/file/delete_upload_task`;
   }
 
-  function getMiaochuanGuangyaAuthorization() {
-    const manual = normalizeGuangyaAuthorization(UI.fields.miaochuanGuangyaAuthorization?.value || '');
+  function getMiaochuanGuangyaAuthorization(options = {}) {
+    const manual = normalizeGuangyaAuthorization(options.manualAuthorization || UI.fields.miaochuanGuangyaAuthorization?.value || '');
     if (manual) {
       setStoredGuangyaAuthorization(manual);
       return manual;
@@ -4951,7 +5728,10 @@
     return parentId;
   }
 
-  async function getMiaochuanNormalizedForDirectImport() {
+  async function getMiaochuanNormalizedForDirectImport(options = {}) {
+    if (options.normalized && Array.isArray(options.normalized.files)) {
+      return options.normalized;
+    }
     const outputText = String(UI.miaochuanOutput?.value || STATE.lastMiaochuanJsonResult?.outputText || '').trim();
     if (outputText) {
       const payload = safeJsonParse(outputText);
@@ -4984,16 +5764,16 @@
   }
 
   async function importMiaochuanJsonDirectlyToGuangya(options = {}) {
-    const auth = getMiaochuanGuangyaAuthorization();
+    const auth = getMiaochuanGuangyaAuthorization(options);
     if (!auth) {
       throw new Error('还没有光鸭 Authorization。请先打开光鸭页面让脚本自动捕获一次，或在“秒传 JSON”分区粘贴 Bearer Token 后重试。');
     }
-    const normalized = await getMiaochuanNormalizedForDirectImport();
+    const normalized = await getMiaochuanNormalizedForDirectImport(options);
     const files = Array.isArray(normalized.files) ? normalized.files : [];
     if (!files.length) {
       throw new Error('当前没有可直接导入的秒传文件，请先生成光鸭秒传 JSON。');
     }
-    const parentId = String(UI.fields.miaochuanGuangyaParentId?.value || '').trim();
+    const parentId = String(options.parentId != null ? options.parentId : (UI.fields.miaochuanGuangyaParentId?.value || '')).trim();
     const summary = {
       total: files.length,
       success: 0,
@@ -10095,6 +10875,7 @@
       return;
     }
     [
+      'share-link-details',
       'miaochuan-details',
       'magnet-details',
       'move-details',
@@ -10886,7 +11667,7 @@
               <img class="gyp-title-mark" src="https://image.868717.xyz/file/1776301692011_3.svg" alt="" aria-hidden="true" />
               <div class="gyp-title-stack">
                 <div class="gyp-title">光鸭云盘工具</div>
-                <div class="gyp-subtitle">网盘互通 / 磁力云批量添加 / 移动整理 / 批量改名</div>
+                <div class="gyp-subtitle">分享直读 / 网盘互通 / 磁力云批量添加 / 移动整理 / 批量改名</div>
                 <div class="gyp-version">Serenalee (v${SCRIPT_VERSION})</div>
               </div>
             </div>
@@ -11150,6 +11931,52 @@
               <input type="file" accept=".txt,.json,.log,.text,.md" multiple hidden data-role="magnet-file-input" data-keep-enabled="true" />
             </div>
           </details>
+          <details class="gyp-section" data-role="share-link-details">
+            <summary>
+              <span class="gyp-section-summary">
+                <span class="gyp-section-headline">
+                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">🔗</span><span class="gyp-section-title">分享直读</span></span>
+                  <span class="gyp-section-desc">粘贴分享链接、读取目录、勾选后生成或直接导入光鸭</span>
+                </span>
+                <span class="gyp-section-badge" data-role="share-link-count">已选 0/0</span>
+              </span>
+            </summary>
+            <div class="gyp-section-body">
+              <div class="gyp-section-actions">
+                <button type="button" class="secondary" data-action="read-share-link">读取链接目录</button>
+                <button type="button" class="secondary" data-action="select-all-share-link">全选</button>
+                <button type="button" class="secondary" data-action="clear-all-share-link">全不选</button>
+                <button type="button" class="secondary" data-action="generate-miaochuan-from-share-link">按勾选生成 JSON</button>
+                <button type="button" class="secondary" data-action="import-share-link-to-guangya">按勾选直接导入光鸭</button>
+                <button type="button" class="secondary" data-action="clear-share-link">清空结果</button>
+              </div>
+              <div class="gyp-section-note">这是独立于“网盘互通”的新功能。已支持夸克、123 网盘、天翼云盘分享链接直读；123 / 天翼会自动翻页读取完整目录，不再停在第一页 100 项。</div>
+              <label class="gyp-field">
+                <span>分享链接</span>
+                <textarea data-field="shareLinkUrl" class="gyp-miaochuan-log" placeholder="可直接粘贴完整分享链接；如果复制内容里带提取码，也可以一起粘进来。"></textarea>
+              </label>
+              <label class="gyp-field">
+                <span>提取码（可选）</span>
+                <input data-field="shareLinkPasscode" placeholder="优先用你这里手填的；留空则尝试从链接或整段文本里自动识别" />
+              </label>
+              <label class="gyp-field">
+                <span>夸克 Cookie（仅夸克直读时使用）</span>
+                <textarea data-field="shareLinkQuarkCookie" class="gyp-miaochuan-log" placeholder="可选。夸克分享链接如果提示 token/MD5 获取失败，把浏览器 Network 里的完整 Cookie 粘这里；留空会先尝试复用已保存的 Cookie。"></textarea>
+              </label>
+              <label class="gyp-field">
+                <span>光鸭 Authorization（按勾选直接导入时使用）</span>
+                <textarea data-field="shareLinkGuangyaAuthorization" class="gyp-miaochuan-token" placeholder="可选。默认会先复用已保存的 Bearer Token 或当前光鸭页面自动捕获到的认证。"></textarea>
+              </label>
+              <label class="gyp-field">
+                <span>光鸭目标 parentId（可选）</span>
+                <input data-field="shareLinkGuangyaParentId" placeholder="留空导入到光鸭根目录；需要指定目录时再填" />
+              </label>
+              <div class="gyp-inline-help" data-role="share-link-summary">粘贴分享链接后，先点“读取链接目录”，这里会显示可勾选的文件清单。</div>
+              <div class="gyp-import-list gyp-empty-dir-list" data-role="share-link-list">
+                <div class="gyp-import-empty">粘贴分享链接后，先点“读取链接目录”，这里会显示可勾选的文件清单。</div>
+              </div>
+            </div>
+          </details>
           <details class="gyp-section" data-role="miaochuan-details">
             <summary>
               <span class="gyp-section-summary">
@@ -11294,6 +12121,10 @@
     UI.magnetFileInput = root.querySelector('[data-role="magnet-file-input"]');
     UI.magnetFileList = root.querySelector('[data-role="magnet-file-list"]');
     UI.magnetFileCount = root.querySelector('[data-role="magnet-file-count"]');
+    UI.shareLinkDetails = root.querySelector('[data-role="share-link-details"]');
+    UI.shareLinkList = root.querySelector('[data-role="share-link-list"]');
+    UI.shareLinkCount = root.querySelector('[data-role="share-link-count"]');
+    UI.shareLinkSummary = root.querySelector('[data-role="share-link-summary"]');
     UI.miaochuanDetails = root.querySelector('[data-role="miaochuan-details"]');
     UI.miaochuanFileInput = root.querySelector('[data-role="miaochuan-file-input"]');
     UI.miaochuanDiagnosis = root.querySelector('[data-role="miaochuan-diagnosis"]');
@@ -11324,6 +12155,11 @@
     UI.fields.cloudBatchLimit = root.querySelector('[data-field="cloudBatchLimit"]');
     UI.fields.cloudDirPrefix = root.querySelector('[data-field="cloudDirPrefix"]');
     UI.fields.moveTargetParentId = root.querySelector('[data-field="moveTargetParentId"]');
+    UI.fields.shareLinkUrl = root.querySelector('[data-field="shareLinkUrl"]');
+    UI.fields.shareLinkPasscode = root.querySelector('[data-field="shareLinkPasscode"]');
+    UI.fields.shareLinkQuarkCookie = root.querySelector('[data-field="shareLinkQuarkCookie"]');
+    UI.fields.shareLinkGuangyaAuthorization = root.querySelector('[data-field="shareLinkGuangyaAuthorization"]');
+    UI.fields.shareLinkGuangyaParentId = root.querySelector('[data-field="shareLinkGuangyaParentId"]');
     UI.fields.miaochuanQuarkCookie = root.querySelector('[data-field="miaochuanQuarkCookie"]');
     UI.fields.miaochuanGuangyaAuthorization = root.querySelector('[data-field="miaochuanGuangyaAuthorization"]');
     UI.fields.miaochuanGuangyaParentId = root.querySelector('[data-field="miaochuanGuangyaParentId"]');
@@ -11333,12 +12169,19 @@
     UI.fields.ruleFlags = root.querySelector('[data-field="ruleFlags"]');
     UI.fields.ruleReplace = root.querySelector('[data-field="ruleReplace"]');
     UI.fields.delayMs = root.querySelector('[data-field="delayMs"]');
+    if (UI.fields.shareLinkQuarkCookie) {
+      UI.fields.shareLinkQuarkCookie.value = getStoredQuarkCookie();
+    }
     if (UI.fields.miaochuanQuarkCookie) {
       UI.fields.miaochuanQuarkCookie.value = getStoredQuarkCookie();
+    }
+    if (UI.fields.shareLinkGuangyaAuthorization) {
+      UI.fields.shareLinkGuangyaAuthorization.value = getStoredGuangyaAuthorization();
     }
     if (UI.fields.miaochuanGuangyaAuthorization) {
       UI.fields.miaochuanGuangyaAuthorization.value = getStoredGuangyaAuthorization();
     }
+    renderShareLinkList();
 
     const closePanel = () => {
       root.classList.remove('gyp-open');
@@ -11622,6 +12465,76 @@
           return;
         }
 
+        if (action === 'read-share-link') {
+          if (UI.shareLinkDetails) {
+            UI.shareLinkDetails.open = true;
+          }
+          await runWithTaskControl('读取分享链接', async (taskControl) => {
+            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备读取分享链接目录...' });
+            const rows = await readShareLinkFromPanel({
+              onProgress: (state) => setProgressBar(state),
+              taskControl,
+            });
+            setProgressBar({ visible: true, percent: 100, indeterminate: false, text: `分享链接读取完成：文件 ${rows.length} 项` });
+          });
+          return;
+        }
+
+        if (action === 'select-all-share-link') {
+          if (UI.shareLinkDetails) {
+            UI.shareLinkDetails.open = true;
+          }
+          setAllShareLinkSelection(true);
+          updatePanelStatus(`已全选分享直读结果：${getSelectedShareLinkRows().length} 项`);
+          return;
+        }
+
+        if (action === 'clear-all-share-link') {
+          if (UI.shareLinkDetails) {
+            UI.shareLinkDetails.open = true;
+          }
+          setAllShareLinkSelection(false);
+          updatePanelStatus('已取消勾选全部分享直读结果');
+          return;
+        }
+
+        if (action === 'generate-miaochuan-from-share-link') {
+          if (UI.shareLinkDetails) {
+            UI.shareLinkDetails.open = true;
+          }
+          setProgressBar({ visible: false });
+          generateMiaochuanJsonFromShareLinkSelection();
+          return;
+        }
+
+        if (action === 'import-share-link-to-guangya') {
+          if (UI.shareLinkDetails) {
+            UI.shareLinkDetails.open = true;
+          }
+          await runWithTaskControl('按勾选导入光鸭', async (taskControl) => {
+            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备按勾选结果导入光鸭...' });
+            const result = generateMiaochuanJsonFromShareLinkSelection();
+            const summary = await importMiaochuanJsonDirectlyToGuangya({
+              normalized: result.normalized,
+              manualAuthorization: UI.fields.shareLinkGuangyaAuthorization?.value || '',
+              parentId: UI.fields.shareLinkGuangyaParentId?.value || '',
+              onProgress: (state) => setProgressBar(state),
+              taskControl,
+            });
+            setProgressBar({ visible: true, percent: 100, indeterminate: false, text: `直接导入完成：成功 ${summary.success}，失败 ${summary.transferFail + summary.mkdirFail + summary.skipped}` });
+            updatePanelStatus(`分享直读导入完成：成功 ${summary.success} 条，失败 ${summary.transferFail + summary.mkdirFail + summary.skipped} 条；详情见诊断报告`);
+          });
+          return;
+        }
+
+        if (action === 'clear-share-link') {
+          if (UI.shareLinkDetails) {
+            UI.shareLinkDetails.open = true;
+          }
+          clearShareLinkPanel();
+          return;
+        }
+
         if (action === 'generate-miaochuan-json') {
           if (UI.miaochuanDetails) {
             UI.miaochuanDetails.open = true;
@@ -11866,6 +12779,18 @@
               UI.miaochuanFileInput.value = '';
             }
           });
+        return;
+      }
+
+      const shareLinkInput = event.target.closest('[data-action="toggle-share-link-file"]');
+      if (shareLinkInput) {
+        const shareLinkKey = shareLinkInput.dataset.shareLinkKey || '';
+        if (!shareLinkKey) {
+          return;
+        }
+        STATE.shareLinkSelection[shareLinkKey] = Boolean(shareLinkInput.checked);
+        renderShareLinkList();
+        updatePanelStatus(`已更新分享直读勾选：${getSelectedShareLinkRows().length}/${(STATE.shareLinkRows || []).length} 项`);
         return;
       }
 
@@ -12354,6 +13279,8 @@
     deleteEmptyDirItems,
     importMagnetTextFiles,
     listCloudTasks,
+    readShareLinkFromPanel,
+    generateMiaochuanJsonFromShareLinkSelection,
     generateMiaochuanJsonFromCapturedPage,
     generateMiaochuanJsonFromPanel,
     normalizeMiaochuanPayload,
