@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         光鸭云盘批量助手 V4
 // @namespace    serenalee.guangyapan.batch-helper
-// @version      0.5.44
+// @version      0.5.71
 // @description  为光鸭云盘网页端提供批量重命名、重复项清理、移动整理、磁力云添加、秒传 JSON 转换/诊断、空目录扫描与删除等功能。
 // @author       Serena Lee
 // @license      Copyright (c) 2026 Serena Lee. All rights reserved.
@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.5.44';
+  const SCRIPT_VERSION = '0.5.71';
 
   // =========================
   // 用户配置区：主要改这里
@@ -57,6 +57,7 @@
       renamePath: '/nd.bizuserres.s/v1/file/rename',
       deletePath: '/nd.bizuserres.s/v1/file/delete_file',
       movePath: '/nd.bizuserres.s/v1/file/move_file',
+      downloadPath: '/nd.bizuserres.s/v1/get_res_download_url',
       createDirPath: '/nd.bizuserres.s/v1/file/create_dir',
       taskStatusPath: '/nd.bizuserres.s/v1/get_task_status',
       resolveResPath: '/nd.bizcloudcollection.s/v1/resolve_res',
@@ -192,6 +193,10 @@
       targetParentId: '',
       batchSize: 20,
     },
+    download: {
+      directBatchSize: 3,
+      exportFormat: 'aria2',
+    },
   };
 
   const LOG_PREFIX = '[光鸭云盘批量助手]';
@@ -203,6 +208,7 @@
   const GUANGYA_AUTH_STORAGE_KEY = '__GYP_BATCH_RENAME_GUANGYA_AUTH__';
   const GUANGYA_CODE_RES_TOKEN_INSTANT = 156;
   const GUANGYA_CODE_DIR_EXISTS = 159;
+  const DIRECT_DOWNLOAD_EXPORT_FORMATS = Object.freeze(['aria2', 'url']);
   const STATE = {
     headers: {},
     lastApiHeaders: null,
@@ -222,6 +228,10 @@
     moveSelectionExpectedCount: 0,
     moveSelectionSource: 'visible',
     moveSelectionWarning: '',
+    directDownloadPreviewItems: [],
+    directDownloadExpectedCount: 0,
+    directDownloadWarning: '',
+    lastDirectDownloadSummary: null,
     emptyDirSelection: {},
     magnetImportFiles: [],
     lastCloudImportSummary: null,
@@ -262,6 +272,10 @@
     moveDetails: null,
     moveSelectionList: null,
     moveSelectionCount: null,
+    directDownloadDetails: null,
+    directDownloadList: null,
+    directDownloadCount: null,
+    directDownloadSummary: null,
     emptyDirList: null,
     emptyDirCount: null,
     emptyDirDetails: null,
@@ -307,6 +321,11 @@
   ]);
   const DEFAULT_LEADING_BRACKET_PATTERN = '^\\s*[\\[【][^\\]】]*[\\]】]\\s*';
   const DEFAULT_DUPLICATE_NUMBERS = '1,2,3';
+  const DIRECT_DOWNLOAD_MAX_DIRS = 600;
+  const DIRECT_DOWNLOAD_MAX_FILES = 10000;
+  const DIRECT_DOWNLOAD_MAX_PAGES_PER_DIR = 200;
+  const SHARE_LINK_MAX_DIRS = 3000;
+  const SHARE_LINK_MAX_FILES = 50000;
   const EMPTY_STATE_TEXT_PATTERNS = [
     /暂无文件/u,
     /空文件夹/u,
@@ -516,6 +535,31 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  function waitForUiPaint(frames = 1) {
+    const totalFrames = Math.max(1, Number(frames || 1));
+    return new Promise((resolve) => {
+      let remaining = totalFrames;
+      const schedule = () => {
+        if (typeof requestAnimationFrame === 'function') {
+          requestAnimationFrame(() => {
+            setTimeout(step, 0);
+          });
+          return;
+        }
+        setTimeout(step, 0);
+      };
+      const step = () => {
+        remaining -= 1;
+        if (remaining <= 0) {
+          resolve();
+          return;
+        }
+        schedule();
+      };
+      schedule();
+    });
+  }
+
   function safeJsonParse(value) {
     if (typeof value !== 'string') {
       return value;
@@ -524,6 +568,21 @@
       return JSON.parse(value);
     } catch {
       return null;
+    }
+  }
+
+  function normalizeDirectDownloadExportFormat(value) {
+    const format = String(value || '').trim().toLowerCase();
+    return DIRECT_DOWNLOAD_EXPORT_FORMATS.includes(format) ? format : 'aria2';
+  }
+
+  function getDirectDownloadExportFormatLabel(format) {
+    switch (normalizeDirectDownloadExportFormat(format)) {
+      case 'url':
+        return 'IDM / 普通 URL';
+      case 'aria2':
+      default:
+        return 'aria2';
     }
   }
 
@@ -595,6 +654,14 @@
             CONFIG.move.batchSize = Math.max(1, Number(saved.move.batchSize));
           }
         }
+        if (saved.download && typeof saved.download === 'object') {
+          if (saved.download.directBatchSize != null && !Number.isNaN(Number(saved.download.directBatchSize))) {
+            CONFIG.download.directBatchSize = Math.max(1, Number(saved.download.directBatchSize));
+          }
+          if (saved.download.exportFormat != null) {
+            CONFIG.download.exportFormat = normalizeDirectDownloadExportFormat(saved.download.exportFormat);
+          }
+        }
       }
     } catch (err) {
       warn('读取已保存配置失败：', err);
@@ -637,6 +704,10 @@
         move: {
           targetParentId: CONFIG.move.targetParentId,
           batchSize: CONFIG.move.batchSize,
+        },
+        download: {
+          directBatchSize: CONFIG.download.directBatchSize,
+          exportFormat: normalizeDirectDownloadExportFormat(CONFIG.download.exportFormat),
         },
       };
       window.localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(payload));
@@ -816,6 +887,11 @@
       STATE.capturedLists[key] = createCapturedListBucket(key);
     }
     return STATE.capturedLists[key] || null;
+  }
+
+  function getCapturedItemsByParentId(parentId) {
+    const bucket = getCapturedListBucket(parentId, { create: false });
+    return Array.isArray(bucket?.items) ? bucket.items : [];
   }
 
   function rebuildCapturedListBucketIndex(bucket) {
@@ -1031,6 +1107,10 @@
 
   function getMoveUrl() {
     return `${CONFIG.request.apiHost}${CONFIG.request.movePath}`;
+  }
+
+  function getDownloadUrl() {
+    return `${CONFIG.request.apiHost}${CONFIG.request.downloadPath}`;
   }
 
   function getCreateDirUrl() {
@@ -2193,10 +2273,17 @@
       truncated = true;
     }
 
+    const cachedItems = dedupeItems(getCapturedItemsByParentId(normalizedParentId));
+    const mergedItems = cachedItems.length > allItems.length
+      ? dedupeItems([...allItems, ...cachedItems])
+      : allItems;
+
     return {
-      items: allItems,
+      items: mergedItems,
       pageCount,
       truncated,
+      cachedCount: cachedItems.length,
+      fetchedCount: allItems.length,
     };
   }
 
@@ -4204,8 +4291,8 @@
     const queue = [{ fileId: '0', path: '' }];
     const visited = new Set();
     const pageSize = 100;
-    const maxDirs = 800;
-    const maxFiles = 50000;
+    const maxDirs = SHARE_LINK_MAX_DIRS;
+    const maxFiles = SHARE_LINK_MAX_FILES;
 
     while (queue.length) {
       const current = queue.shift();
@@ -4428,8 +4515,8 @@
     const queue = [{ fileId: rootFileId, path: `/${shareName}`.replace(/\/{2,}/g, '/') }];
     const visited = new Set();
     const pageSize = 100;
-    const maxDirs = 800;
-    const maxFiles = 50000;
+    const maxDirs = SHARE_LINK_MAX_DIRS;
+    const maxFiles = SHARE_LINK_MAX_FILES;
 
     while (queue.length) {
       const current = queue.shift();
@@ -4756,8 +4843,8 @@
     const queue = [{ fid: '0', path: '' }];
     const visited = new Set();
     const pageSize = 200;
-    const maxDirs = 300;
-    const maxFiles = 10000;
+    const maxDirs = SHARE_LINK_MAX_DIRS;
+    const maxFiles = SHARE_LINK_MAX_FILES;
 
     while (queue.length) {
       const current = queue.shift();
@@ -4779,7 +4866,7 @@
             visible: true,
             percent: 0,
             indeterminate: true,
-            text: `正在读取夸克目录：${current.path || '/'} | 已收集 ${rows.length} 个文件`,
+            text: `正在读取夸克目录：${current.path || '/'} | 已读目录 ${visited.size}/${maxDirs} | 待读目录 ${queue.length} | 已收集 ${rows.length} 个文件`,
           });
         }
         const payload = await fetchQuarkShareDetailPage({ pwdId, stoken, pdirFid: dirFid, page, size: pageSize, cookie });
@@ -5524,8 +5611,12 @@
     return result;
   }
 
-  function downloadMiaochuanText(filename, text) {
-    const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+  function downloadMiaochuanText(filename, text, mimeType = 'application/json;charset=utf-8') {
+    const blob = new Blob([text], { type: mimeType || 'application/octet-stream' });
+    downloadBlobFile(blob, filename);
+  }
+
+  function downloadBlobFile(blob, filename) {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
@@ -6419,6 +6510,128 @@
     ]);
   }
 
+  function isCompactRawScalar(value) {
+    return value == null || ['string', 'number', 'boolean'].includes(typeof value);
+  }
+
+  function compactNormalizedItemRaw(obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      return {};
+    }
+
+    const out = {};
+    const pickedKeys = [
+      'fileId',
+      'id',
+      'resourceId',
+      'resId',
+      'bizId',
+      'objId',
+      'shareFileId',
+      'share_file_id',
+      'dirId',
+      'dir_id',
+      'folderId',
+      'folder_id',
+      'parentId',
+      'parent_id',
+      'pid',
+      'parentFileId',
+      'parent_file_id',
+      'name',
+      'fileName',
+      'file_name',
+      'filename',
+      'resName',
+      'resourceName',
+      'title',
+      'displayName',
+      'display_name',
+      'originalName',
+      'original_name',
+      'fileFullName',
+      'fullName',
+      'path',
+      'filePath',
+      'file_path',
+      'fullPath',
+      'full_path',
+      'ext',
+      'size',
+      'fileSize',
+      'file_size',
+      'resourceSize',
+      'resource_size',
+      'resSize',
+      'res_size',
+      'bytes',
+      'length',
+      'gcid',
+      'md5',
+      'fileMd5',
+      'file_md5',
+      'etag',
+      'contentMd5',
+      'content_md5',
+      'content_hash',
+      'contentHash',
+      'content_hash_name',
+      'contentHashName',
+      'fileHash',
+      'file_hash',
+      'resHash',
+      'res_hash',
+      'resourceHash',
+      'resource_hash',
+      'hash',
+      'digest',
+      'checksum',
+      'hashType',
+      'hash_type',
+      'isDir',
+      'is_dir',
+      'isFolder',
+      'is_folder',
+      'folder',
+      'directory',
+      'dir',
+      'dirType',
+      'dir_type',
+      'itemType',
+      'item_type',
+      'nodeType',
+      'node_type',
+      'resourceType',
+      'resource_type',
+      'resType',
+      'res_type',
+      'fileType',
+      'file_type',
+      'type',
+      'kind',
+      'bizType',
+      'biz_type',
+      'fromDom',
+      'domIsDir',
+    ];
+
+    for (const key of pickedKeys) {
+      if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+        continue;
+      }
+      const value = obj[key];
+      if (isCompactRawScalar(value)) {
+        out[key] = value;
+        continue;
+      }
+      if (Array.isArray(value) && value.length <= 24 && value.every((entry) => isCompactRawScalar(entry))) {
+        out[key] = value.slice();
+      }
+    }
+
+    return out;
+  }
+
   function normalizeItem(obj) {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
       return null;
@@ -6456,7 +6669,7 @@
         name,
         parentId: String(obj.parentId ?? obj.parent_id ?? obj.pid ?? obj.parentFileId ?? obj.parent_file_id ?? ''),
         isDir: guessItemIsDirectory(obj, name),
-        raw: obj,
+        raw: compactNormalizedItemRaw(obj),
       };
     }
 
@@ -6506,6 +6719,566 @@
         .map((item) => normalizeItem(item))
         .filter(Boolean)
     );
+  }
+
+  function getPageWindowObject() {
+    try {
+      if (typeof unsafeWindow !== 'undefined' && unsafeWindow) {
+        return unsafeWindow;
+      }
+    } catch {}
+    return window;
+  }
+
+  function getPageRuntimeWindows() {
+    return dedupeElements([window, getPageWindowObject()].filter(Boolean));
+  }
+
+  function getExplicitSelectedState(obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      return null;
+    }
+
+    const keys = [
+      'selected',
+      'isSelected',
+      'is_selected',
+      'checked',
+      'isChecked',
+      'is_checked',
+      'choose',
+      'chosen',
+      'isChoose',
+      'isChosen',
+      'is_choose',
+      'is_chosen',
+    ];
+
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+        continue;
+      }
+      const normalized = normalizeBooleanish(obj[key]);
+      if (normalized != null) {
+        return normalized;
+      }
+    }
+
+    return null;
+  }
+
+  function isLikelySelectedItemsKey(key = '') {
+    const text = String(key || '').trim();
+    if (!text) {
+      return false;
+    }
+    return /(?:^|_)(selected|checked)(?:rows?|items?|files?|list)?$/iu.test(text)
+      || /^(?:selectedRows|selectedItems|selectedFiles|checkedRows|checkedItems|checkedFiles|selectedList|checkedList|selection)$/iu.test(text)
+      || /(?:selected|checked|choose|chosen|selection).*(?:rows?|items?|files?|records?|nodes?|list|data)$/iu.test(text)
+      || /^(?:rows?|items?|files?|records?|nodes?)Selected$/iu.test(text);
+  }
+
+  function isLikelySelectedIdsKey(key = '') {
+    const text = String(key || '').trim();
+    if (!text) {
+      return false;
+    }
+    return /^(?:selected(?:Row)?Keys|selectedIds|selectedFileIds|checkedKeys|checkedIds|selectedMap|checkedMap|selectionMap|selectionIds?)$/iu.test(text)
+      || /(?:selected|checked|choose|chosen|selection).*(?:ids?|keys?|map|set|list)$/iu.test(text)
+      || /^(?:ids?|keys?|map|set|list)(?:Selected|Checked)$/iu.test(text);
+  }
+
+  function isDomLikeNode(value) {
+    return Boolean(value && typeof value === 'object' && typeof value.nodeType === 'number');
+  }
+
+  function scoreLikelyStateKey(key = '') {
+    const text = String(key || '').trim();
+    if (!text) {
+      return Number.NEGATIVE_INFINITY;
+    }
+
+    let score = 0;
+    if (/(selected|selection|checked|choose|chosen)/iu.test(text)) score += 140;
+    if (/(store|state)/iu.test(text)) score += 80;
+    if (/(file|list|row|item|record|folder|dir|resource|res|disk|drive)/iu.test(text)) score += 50;
+    if (/^__.*__$/.test(text)) score += 25;
+    if (text.length > 64) score -= 30;
+    return score;
+  }
+
+  function collectRelatedFrameworkObjects(seed, out = [], options = {}) {
+    const queue = Array.isArray(seed) ? [...seed] : [seed];
+    const seen = options.seen || new WeakSet();
+    const maxNodes = Math.max(32, Number(options.maxNodes || 240));
+    let visited = 0;
+
+    while (queue.length && visited < maxNodes) {
+      const current = queue.shift();
+      if (!current || (typeof current !== 'object' && typeof current !== 'function') || isDomLikeNode(current)) {
+        continue;
+      }
+      if (seen.has(current)) {
+        continue;
+      }
+      seen.add(current);
+      visited += 1;
+      out.push(current);
+
+      const nextValues = [
+        current.current,
+        current._internalRoot,
+        current.memoizedProps,
+        current.pendingProps,
+        current.memoizedState,
+        current.baseState,
+        current.updateQueue,
+        current.dependencies,
+        current.queue,
+        current.baseQueue,
+        current.shared,
+        current.child,
+        current.sibling,
+        current.return,
+        current.alternate,
+        current.stateNode,
+        current.containerInfo,
+        current.ctx,
+        current.setupState,
+        current.data,
+        current.props,
+        current.proxy,
+        current.exposed,
+        current.subTree,
+        current.vnode,
+        current.appContext,
+        current.provides,
+        current.refs,
+        current.renderContext,
+        current.root,
+        current.store,
+      ];
+
+      const keyedCandidates = [];
+      try {
+        for (const [key, value] of Object.entries(current)) {
+          if (
+            value
+            && (typeof value === 'object' || typeof value === 'function')
+            && !isDomLikeNode(value)
+            && /(?:selected|selection|checked|choose|chosen|store|state|memoized|props|current|child|sibling|return|alternate|file|list|row|item|record|folder|resource|res)/iu.test(key)
+          ) {
+            keyedCandidates.push(value);
+          }
+          if (keyedCandidates.length >= 32) {
+            break;
+          }
+        }
+      } catch {}
+
+      for (const value of [...nextValues, ...keyedCandidates]) {
+        if (!value || (typeof value !== 'object' && typeof value !== 'function') || isDomLikeNode(value)) {
+          continue;
+        }
+        queue.push(value);
+      }
+    }
+
+    return out;
+  }
+
+  function collectSelectionMarkers(value, marker = null, options = {}) {
+    const out = marker || {
+      ids: new Set(),
+      names: new Set(),
+    };
+    const seen = options.seen || new WeakSet();
+    const depth = Number(options.depth || 0);
+    if (value == null || depth > 5) {
+      return out;
+    }
+
+    if (typeof value === 'string' || typeof value === 'number') {
+      const text = String(value).trim();
+      if (looksLikeStructuredEntityId(text)) {
+        out.ids.add(text);
+      } else if (isProbablyUsefulName(text) && !isProbablyMetadataText(text)) {
+        out.names.add(normalizeDomName(text));
+      }
+      return out;
+    }
+
+    if (typeof value !== 'object') {
+      return out;
+    }
+    if (seen.has(value)) {
+      return out;
+    }
+    seen.add(value);
+
+    if (value instanceof Set) {
+      for (const entry of value.values()) {
+        collectSelectionMarkers(entry, out, {
+          seen,
+          depth: depth + 1,
+        });
+      }
+      return out;
+    }
+
+    if (value instanceof Map) {
+      for (const [key, entry] of value.entries()) {
+        if (looksLikeStructuredEntityId(key) && normalizeBooleanish(entry) === true) {
+          out.ids.add(String(key));
+          continue;
+        }
+        collectSelectionMarkers(key, out, {
+          seen,
+          depth: depth + 1,
+        });
+        collectSelectionMarkers(entry, out, {
+          seen,
+          depth: depth + 1,
+        });
+      }
+      return out;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        collectSelectionMarkers(item, out, {
+          seen,
+          depth: depth + 1,
+        });
+      }
+      return out;
+    }
+
+    const normalized = normalizeItem(value);
+    const explicit = getExplicitSelectedState(value);
+    if (normalized && explicit === true) {
+      out.ids.add(String(normalized.fileId || ''));
+      out.dirCandidates = out.dirCandidates || new Set();
+      for (const id of normalizeIdCandidates([normalized.fileId, normalized.dirId, ...(normalized.dirIdCandidates || [])])) {
+        out.ids.add(String(id || ''));
+      }
+      out.names.add(normalizeDomName(normalized.name || ''));
+    }
+
+    for (const [key, entry] of Object.entries(value)) {
+      if (looksLikeStructuredEntityId(key) && normalizeBooleanish(entry) === true) {
+        out.ids.add(String(key));
+        continue;
+      }
+      if (/^(?:fileId|id|resourceId|resId|bizId|objId|dirId|folderId)$/iu.test(key) && entry != null) {
+        const text = String(entry).trim();
+        if (looksLikeStructuredEntityId(text)) {
+          out.ids.add(text);
+        }
+        continue;
+      }
+      if (/^(?:name|fileName|filename|title|displayName|fullName|originalName)$/iu.test(key) && typeof entry === 'string') {
+        const text = normalizeDomName(entry);
+        if (text && isProbablyUsefulName(text) && !isProbablyMetadataText(text)) {
+          out.names.add(text);
+        }
+      }
+      if (entry && typeof entry === 'object') {
+        collectSelectionMarkers(entry, out, {
+          seen,
+          depth: depth + 1,
+        });
+      }
+    }
+
+    return out;
+  }
+
+  function itemMatchesSelectionMarkers(item, marker) {
+    if (!item || !marker) {
+      return false;
+    }
+    const candidates = normalizeIdCandidates([item.fileId, item.dirId, ...(item.dirIdCandidates || [])]).map((value) => String(value || ''));
+    if (candidates.some((value) => marker.ids.has(value))) {
+      return true;
+    }
+    const nameKey = normalizeDomName(item.name || '');
+    return Boolean(nameKey && marker.names.has(nameKey));
+  }
+
+  function collectSelectedItemsFromUnknownObject(node, out = [], options = {}) {
+    const seen = options.seen || new WeakSet();
+    const depth = Number(options.depth || 0);
+    if (!node || typeof node !== 'object' || depth > 5) {
+      return out;
+    }
+    if (seen.has(node)) {
+      return out;
+    }
+    seen.add(node);
+
+    if (node instanceof Set) {
+      for (const entry of node.values()) {
+        if (entry && typeof entry === 'object') {
+          collectSelectedItemsFromUnknownObject(entry, out, {
+            seen,
+            depth: depth + 1,
+          });
+        }
+      }
+      return out;
+    }
+
+    if (node instanceof Map) {
+      for (const [key, value] of node.entries()) {
+        if (value && typeof value === 'object') {
+          collectSelectedItemsFromUnknownObject(value, out, {
+            seen,
+            depth: depth + 1,
+          });
+        }
+        if (key && typeof key === 'object') {
+          collectSelectedItemsFromUnknownObject(key, out, {
+            seen,
+            depth: depth + 1,
+          });
+        }
+      }
+      return out;
+    }
+
+    if (Array.isArray(node)) {
+      const directSelected = [];
+      for (const entry of node) {
+        const normalized = normalizeItem(entry);
+        if (!normalized) {
+          continue;
+        }
+        if (getExplicitSelectedState(entry) === true) {
+          directSelected.push(normalized);
+        }
+      }
+      if (directSelected.length) {
+        out.push(...directSelected);
+      }
+      for (const entry of node) {
+        if (entry && typeof entry === 'object') {
+          collectSelectedItemsFromUnknownObject(entry, out, {
+            seen,
+            depth: depth + 1,
+          });
+        }
+      }
+      return out;
+    }
+
+    const explicit = getExplicitSelectedState(node);
+    const normalized = normalizeItem(node);
+    if (normalized && explicit === true) {
+      out.push(normalized);
+    }
+
+    const marker = {
+      ids: new Set(),
+      names: new Set(),
+    };
+
+    for (const [key, value] of Object.entries(node)) {
+      if (isLikelySelectedItemsKey(key)) {
+        out.push(...normalizeItemsFromArray(Array.isArray(value) ? value : extractItemsFromUnknownObject(value)));
+        collectSelectionMarkers(value, marker, {
+          depth: depth + 1,
+        });
+        continue;
+      }
+      if (isLikelySelectedIdsKey(key)) {
+        collectSelectionMarkers(value, marker, {
+          depth: depth + 1,
+        });
+      }
+    }
+
+    if (marker.ids.size || marker.names.size) {
+      for (const [key, value] of Object.entries(node)) {
+        if (!value || typeof value !== 'object' || !Array.isArray(value) || !value.length) {
+          continue;
+        }
+        if (!isLikelyListArrayKey(key) && !value.some((entry) => normalizeItem(entry))) {
+          continue;
+        }
+        for (const item of normalizeItemsFromArray(value)) {
+          if (itemMatchesSelectionMarkers(item, marker)) {
+            out.push(item);
+          }
+        }
+      }
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === 'object') {
+        collectSelectedItemsFromUnknownObject(value, out, {
+          seen,
+          depth: depth + 1,
+        });
+      }
+    }
+
+    return out;
+  }
+
+  function getWindowSelectionStateCandidates() {
+    const candidates = [];
+    const exactKeys = [
+      '__INITIAL_STATE__',
+      '__INITIAL_DATA__',
+      '__APP_STATE__',
+      '__APP_DATA__',
+      '__STORE__',
+      '__NEXT_DATA__',
+      '__NUXT__',
+      'store',
+      'appStore',
+      'pageStore',
+      'listStore',
+      'fileStore',
+      'diskStore',
+      'selectionStore',
+      'selectedStore',
+      'reduxStore',
+      '__REACT_DEVTOOLS_GLOBAL_HOOK__',
+    ];
+
+    for (const runtimeWindow of getPageRuntimeWindows()) {
+      for (const key of exactKeys) {
+        try {
+          const value = runtimeWindow[key];
+          value && candidates.push(value);
+        } catch {}
+      }
+
+      try {
+        const dynamicKeys = Array.from(new Set([
+          ...Object.keys(runtimeWindow),
+          ...Object.getOwnPropertyNames(runtimeWindow),
+        ]))
+          .filter((key) => scoreLikelyStateKey(key) > 0)
+          .sort((left, right) => scoreLikelyStateKey(right) - scoreLikelyStateKey(left) || left.length - right.length)
+          .slice(0, 240);
+        for (const key of dynamicKeys) {
+          try {
+            const value = runtimeWindow[key];
+            value && candidates.push(value);
+          } catch {}
+        }
+      } catch {}
+
+      try {
+        const hook = runtimeWindow.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+        if (hook) {
+          candidates.push(hook);
+          hook.renderers && candidates.push(hook.renderers);
+          hook._fiberRoots && candidates.push(hook._fiberRoots);
+          if (hook.renderers instanceof Map && typeof hook.getFiberRoots === 'function') {
+            for (const rendererId of hook.renderers.keys()) {
+              try {
+                const roots = hook.getFiberRoots(rendererId);
+                roots && candidates.push(roots);
+              } catch {}
+            }
+          }
+        }
+      } catch {}
+    }
+
+    return dedupeElements(candidates);
+  }
+
+  function getPageFrameworkStateRoots() {
+    const appRoots = dedupeElements(Array.from(document.querySelectorAll(
+      '#root, #app, #__next, #__nuxt, [data-reactroot], main, [role="main"], [class*="app"]'
+    )).filter((node) => node && !isHelperPanelNode(node)).slice(0, 16));
+    const roots = dedupeElements([
+      ...getListRows().slice(0, 16),
+      findScrollableListContainer(),
+      findScrollableListContainer()?.parentElement,
+      findScrollableListContainer()?.parentElement?.parentElement,
+      ...appRoots,
+      ...getWindowSelectionStateCandidates(),
+    ].filter(Boolean));
+    const frameworkRoots = [];
+    const relatedSeen = new WeakSet();
+
+    for (const root of roots) {
+      frameworkRoots.push(root);
+      if (root?.parentElement) {
+        frameworkRoots.push(root.parentElement);
+      }
+      for (const candidate of collectFrameworkObjectCandidatesFromNode(root)) {
+        frameworkRoots.push(candidate);
+        collectRelatedFrameworkObjects(candidate, frameworkRoots, {
+          seen: relatedSeen,
+          maxNodes: 320,
+        });
+      }
+    }
+
+    return dedupeElements(frameworkRoots.filter(Boolean));
+  }
+
+  function collectSelectionMarkersFromPageFrameworkState() {
+    const marker = {
+      ids: new Set(),
+      names: new Set(),
+    };
+    const seenObjects = new WeakSet();
+
+    for (const candidate of getPageFrameworkStateRoots()) {
+      if (!candidate || (typeof candidate !== 'object' && typeof candidate !== 'function')) {
+        continue;
+      }
+      collectSelectionMarkers(candidate, marker, {
+        seen: seenObjects,
+      });
+      if (typeof candidate.getState === 'function') {
+        try {
+          const state = candidate.getState();
+          state && collectSelectionMarkers(state, marker, {
+            seen: seenObjects,
+          });
+        } catch {}
+      }
+    }
+
+    return marker;
+  }
+
+  function collectSelectedItemsFromPageFrameworkState(options = {}) {
+    const frameworkRoots = getPageFrameworkStateRoots();
+
+    const selected = [];
+    const seenObjects = new WeakSet();
+    for (const candidate of frameworkRoots) {
+      if (!candidate || (typeof candidate !== 'object' && typeof candidate !== 'function')) {
+        continue;
+      }
+      collectSelectedItemsFromUnknownObject(candidate, selected, {
+        seen: seenObjects,
+      });
+      if (typeof candidate.getState === 'function') {
+        try {
+          const state = candidate.getState();
+          state && collectSelectedItemsFromUnknownObject(state, selected, {
+            seen: seenObjects,
+          });
+        } catch {}
+      }
+    }
+
+    const deduped = dedupeItems(selected).filter((item) => item && item.fileId && !isSyntheticDomId(item.fileId));
+    if (options.onlyDirectories) {
+      return deduped.filter((item) => item.isDir === true || shouldTreatItemAsDirectory(item));
+    }
+    return deduped;
   }
 
   function isLikelyListArrayKey(key = '') {
@@ -6932,6 +7705,8 @@
     const stableMs = Math.max(intervalMs, Number(options.stableMs || 360));
     const expectedName = normalizeDomName(options.expectedName || '');
     const previousParentId = String(previousSnapshot?.parentId || '').trim();
+    const previousName = normalizeDomName(previousSnapshot?.name || '');
+    const previousHash = normalizeHashRoute(previousSnapshot?.hash || '');
     const deadline = Date.now() + timeoutMs;
     let candidate = null;
     let candidateAt = 0;
@@ -6940,13 +7715,18 @@
       const snapshot = getDirectoryContextSnapshot();
       const currentParentId = String(snapshot.parentId || '').trim();
       const parentChanged = Boolean(currentParentId && currentParentId !== previousParentId && !isSyntheticDomId(currentParentId));
+      const currentName = normalizeDomName(snapshot.name || '');
+      const hashChanged = normalizeHashRoute(snapshot.hash || '') !== previousHash;
+      const nameChanged = Boolean(currentName && currentName !== previousName);
       const nameMatches = !expectedName
         || !snapshot.name
         || textLooksLikeExpected(snapshot.name, expectedName)
         || textLooksLikeExpected(expectedName, snapshot.name);
+      const plausibleChange = parentChanged || hashChanged || (nameChanged && nameMatches);
 
-      if (parentChanged && nameMatches) {
-        if (!candidate || candidate.parentId !== currentParentId) {
+      if (plausibleChange && nameMatches) {
+        const candidateKey = currentParentId || normalizeHashRoute(snapshot.hash || '') || currentName;
+        if (!candidate || (candidate.parentId || normalizeHashRoute(candidate.hash || '') || normalizeDomName(candidate.name || '')) !== candidateKey) {
           candidate = snapshot;
           candidateAt = Date.now();
         } else if (Date.now() - candidateAt >= stableMs) {
@@ -6990,7 +7770,7 @@
 
     return (
       /^(type(?:unknown|file|folder|video|audio|image|document|other|torrent)|filetypeunknown)$/i.test(value) ||
-      /^(其他|未知类型|文件类型)$/u.test(value) ||
+      /^(其他|未知类型|文件类型|视频|图片|音频|文档|压缩包|种子|字幕)$/u.test(value) ||
       /^\d+(\.\d+)?\s*(B|KB|MB|GB|TB|PB)$/i.test(value) ||
       /^\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}/.test(value) ||
       /^(今天|昨天|刚刚|\d{1,2}:\d{2})$/.test(value) ||
@@ -7163,6 +7943,252 @@
     });
 
     return items;
+  }
+
+  function scanItemsSafe(node, out = [], seen = new WeakSet(), depth = 0) {
+    if (!node || typeof node !== 'object' || depth > 5) {
+      return out;
+    }
+    if (seen.has(node)) {
+      return out;
+    }
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        scanItemsSafe(item, out, seen, depth + 1);
+      }
+      return out;
+    }
+
+    const normalized = normalizeItem(node);
+    if (normalized) {
+      out.push(normalized);
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === 'object') {
+        scanItemsSafe(value, out, seen, depth + 1);
+      }
+    }
+
+    return out;
+  }
+
+  function extractItemsFromUnknownObject(node) {
+    const explicitCandidate = pickBestItemArrayCandidate(node);
+    if (explicitCandidate) {
+      return explicitCandidate.items;
+    }
+    return dedupeItems(scanItemsSafe(node));
+  }
+
+  function looksLikeStructuredEntityId(value) {
+    const text = String(value || '').trim();
+    if (!text || /^dom(?:dir)?:/u.test(text)) {
+      return false;
+    }
+    return /^\d{6,}$/u.test(text) || /^[A-Za-z0-9_-]{12,}$/u.test(text);
+  }
+
+  function toCamelAttrKey(name = '') {
+    return String(name || '')
+      .replace(/^data[-_:]*/iu, '')
+      .replace(/[-_:]+([a-z0-9])/giu, (_, ch) => ch.toUpperCase())
+      .replace(/[^a-z0-9]/giu, '');
+  }
+
+  function buildItemSnapshotFromDomNode(node, expectedName = '', expectedIsDir = false) {
+    if (!node || typeof node !== 'object') {
+      return null;
+    }
+
+    const snapshot = {};
+    const assignValue = (key, value) => {
+      if (!key || value == null || value === '') {
+        return;
+      }
+      snapshot[key] = value;
+    };
+
+    if (node.dataset && typeof node.dataset === 'object') {
+      for (const [key, value] of Object.entries(node.dataset)) {
+        if (
+          /^(?:file|folder|dir|resource|res|biz|obj|share|parent).*id$/iu.test(key)
+          || /^(?:name|fileName|folderName|dirName|resourceType|resType|fileType|type|kind|dirType|isDir|isFolder)$/iu.test(key)
+        ) {
+          assignValue(key, value);
+        }
+      }
+    }
+
+    if (node.attributes && typeof node.attributes.length === 'number') {
+      for (const attr of Array.from(node.attributes)) {
+        const attrName = String(attr?.name || '');
+        const attrValue = String(attr?.value || '').trim();
+        if (!attrName || !attrValue) {
+          continue;
+        }
+        if (/^(title|aria-label|data-name|data-filename)$/iu.test(attrName)) {
+          assignValue(toCamelAttrKey(attrName), attrValue);
+          continue;
+        }
+        if (/(?:file|folder|dir|resource|res|biz|obj|share|parent).*id/iu.test(attrName) && looksLikeStructuredEntityId(attrValue)) {
+          assignValue(toCamelAttrKey(attrName), attrValue);
+        }
+      }
+    }
+
+    if (expectedName && !snapshot.name && !snapshot.fileName && !snapshot.folderName && !snapshot.dirName) {
+      snapshot.name = String(expectedName || '');
+      snapshot.fileName = String(expectedName || '');
+      if (expectedIsDir) {
+        snapshot.folderName = String(expectedName || '');
+        snapshot.dirName = String(expectedName || '');
+      }
+    }
+
+    if (expectedIsDir) {
+      snapshot.isDir = true;
+      snapshot.isFolder = true;
+      snapshot.dirType = snapshot.dirType || 1;
+      if (!snapshot.dirId && snapshot.fileId) {
+        snapshot.dirId = snapshot.fileId;
+      }
+      if (!snapshot.folderId && (snapshot.dirId || snapshot.fileId)) {
+        snapshot.folderId = snapshot.dirId || snapshot.fileId;
+      }
+    }
+
+    return Object.keys(snapshot).length ? snapshot : null;
+  }
+
+  function collectFrameworkObjectCandidatesFromNode(node) {
+    if (!node || typeof node !== 'object') {
+      return [];
+    }
+
+    const out = [];
+    const ownKeys = Object.keys(node);
+    for (const key of ownKeys) {
+      if (
+        key === '__vue__'
+        || key === '__vueParentComponent'
+        || key === '__vue_app__'
+        || key === '_reactRootContainer'
+        || key.startsWith('__reactFiber$')
+        || key.startsWith('__reactProps$')
+        || key.startsWith('__reactContainer$')
+        || key.startsWith('__reactInternalInstance$')
+      ) {
+        collectRelatedFrameworkObjects(node[key], out, {
+          maxNodes: 160,
+        });
+      }
+    }
+
+    if (node.__vue__) {
+      collectRelatedFrameworkObjects(node.__vue__, out, {
+        maxNodes: 160,
+      });
+    }
+    if (node.__vueParentComponent) {
+      collectRelatedFrameworkObjects(node.__vueParentComponent, out, {
+        maxNodes: 160,
+      });
+    }
+    if (node._reactRootContainer) {
+      collectRelatedFrameworkObjects(node._reactRootContainer, out, {
+        maxNodes: 160,
+      });
+    }
+
+    return out.filter(Boolean);
+  }
+
+  function extractNormalizedItemsFromRow(row, expectedName = '', expectedIsDir = false) {
+    if (!row) {
+      return [];
+    }
+
+    const aggregated = [];
+    const pushItems = (items = []) => {
+      for (const item of items || []) {
+        if (!item) {
+          continue;
+        }
+        aggregated.push({
+          ...item,
+          name: String(item.name || expectedName || ''),
+          isDir: expectedIsDir ? true : (item.isDir === true || shouldTreatItemAsDirectory(item)),
+          raw: item.raw || {},
+        });
+      }
+    };
+
+    const scanNodes = (nodes = []) => {
+      for (const node of nodes) {
+        const snapshot = buildItemSnapshotFromDomNode(node, expectedName, expectedIsDir);
+        if (snapshot) {
+          pushItems(normalizeItemsFromArray([snapshot]));
+        }
+
+        const candidates = collectFrameworkObjectCandidatesFromNode(node);
+        for (const candidate of candidates) {
+          pushItems(extractItemsFromUnknownObject(candidate));
+        }
+      }
+    };
+
+    const directNodes = dedupeElements([
+      row,
+      ...Array.from(row.querySelectorAll('*')).slice(0, 80),
+    ]);
+    scanNodes(directNodes);
+
+    const hasResolvedDirectItems = aggregated.some((item) => item && item.fileId && !isSyntheticDomId(item.fileId));
+    if (!hasResolvedDirectItems) {
+      const fallbackNodes = dedupeElements([
+        row.parentElement,
+        row.parentElement?.parentElement,
+        row.previousElementSibling,
+        row.nextElementSibling,
+      ].filter(Boolean).flatMap((node) => [
+        node,
+        ...Array.from(node.querySelectorAll ? node.querySelectorAll('*') : []).slice(0, 24),
+      ]));
+      scanNodes(fallbackNodes);
+    }
+
+    return dedupeItems(aggregated);
+  }
+
+  function buildNormalizedItemsFromVisibleRows(rows = []) {
+    const out = [];
+
+    for (const entry of rows || []) {
+      if (!entry?.row) {
+        continue;
+      }
+      const candidates = extractNormalizedItemsFromRow(entry.row, entry.name || '', entry.isDir === true);
+      const typed = candidates.filter((candidate) => (candidate.isDir === true || shouldTreatItemAsDirectory(candidate)) === (entry.isDir === true));
+      const nameMatched = (typed.length ? typed : candidates).filter((candidate) => {
+        const candidateName = String(candidate?.name || '').trim();
+        return !entry.name || !candidateName || textLooksLikeExpected(candidateName, entry.name) || textLooksLikeExpected(entry.name, candidateName);
+      });
+      const chosen = (nameMatched.length ? nameMatched : (typed.length ? typed : candidates))[0];
+      if (!chosen || !chosen.fileId || isSyntheticDomId(chosen.fileId)) {
+        continue;
+      }
+      out.push({
+        ...chosen,
+        name: String(chosen.name || entry.name || ''),
+        isDir: entry.isDir === true || chosen.isDir === true || shouldTreatItemAsDirectory(chosen),
+        row: entry.row,
+      });
+    }
+
+    return dedupeItems(out);
   }
 
   function collectVisibleDirectoryHints(expectedNames = []) {
@@ -7906,31 +8932,81 @@
 
   function buildCheckedPageSelectionPreviewItems(options = {}) {
     const onlyDirectories = Boolean(options.onlyDirectories);
-    const entries = dedupeElements([
-      ...collectVisibleListRowEntries(),
-      ...collectCheckedListRowEntries(),
-    ]);
-    const seen = new Set();
-    const out = [];
+    const visibleEntries = collectVisibleListRowEntries();
+    const entries = visibleEntries.some((entry) => entry?.checkbox && isElementChecked(entry.checkbox))
+      ? visibleEntries
+      : collectCheckedListRowEntries();
+    const checkedEntries = [];
+    const seenRows = new Set();
 
     for (const entry of entries) {
       if (!entry?.checkbox || !isElementChecked(entry.checkbox)) {
         continue;
       }
-      if (onlyDirectories && !entry.isDir) {
+      const rowKey = entry.row || entry.checkbox;
+      if (rowKey && seenRows.has(rowKey)) {
+        continue;
+      }
+      rowKey && seenRows.add(rowKey);
+      checkedEntries.push(entry);
+    }
+
+    if (!checkedEntries.length) {
+      return [];
+    }
+
+    const resolvedByRow = new Map(
+      buildNormalizedItemsFromVisibleRows(checkedEntries)
+        .filter((item) => item?.row)
+        .map((item) => [item.row, item])
+    );
+    const seen = new Set();
+    const out = [];
+
+    for (const entry of checkedEntries) {
+      const resolvedRowItem = entry.row ? resolvedByRow.get(entry.row) : null;
+      const effectiveName = String(resolvedRowItem?.name || entry.name || '');
+      const effectiveIsDir = resolvedRowItem
+        ? (resolvedRowItem.isDir === true || shouldTreatItemAsDirectory(resolvedRowItem))
+        : (entry.isDir === true);
+      if (onlyDirectories && !effectiveIsDir) {
         continue;
       }
 
-      const normalizedName = normalizeDomName(entry.name || '');
-      const key = `${entry.isDir ? 'dir' : 'file'}:${normalizedName}`;
+      const normalizedName = normalizeDomName(effectiveName);
+      const key = resolvedRowItem && resolvedRowItem.fileId && !isSyntheticDomId(resolvedRowItem.fileId)
+        ? `id:${String(resolvedRowItem.fileId)}`
+        : `${effectiveIsDir ? 'dir' : 'file'}:${normalizedName}`;
       if (!normalizedName || seen.has(key)) {
         continue;
       }
       seen.add(key);
+
+      if (resolvedRowItem && resolvedRowItem.fileId && !isSyntheticDomId(resolvedRowItem.fileId)) {
+        out.push({
+          fileId: String(resolvedRowItem.fileId),
+          dirId: String(resolvedRowItem.dirId || resolvedRowItem.fileId),
+          dirIdCandidates: normalizeIdCandidates(
+            resolvedRowItem.dirIdCandidates || [resolvedRowItem.dirId, resolvedRowItem.fileId]
+          ),
+          name: effectiveName,
+          parentId: String(resolvedRowItem.parentId || ''),
+          isDir: effectiveIsDir,
+          row: entry.row || resolvedRowItem.row || null,
+          raw: resolvedRowItem.raw || {},
+          resolved: true,
+        });
+        continue;
+      }
+
       out.push({
-        fileId: `dom:checked:${out.length}:${entry.name}`,
-        name: String(entry.name || ''),
-        isDir: entry.isDir === true,
+        fileId: `dom:checked:${out.length}:${effectiveName}`,
+        dirId: `dom:checked:${out.length}:${effectiveName}`,
+        dirIdCandidates: [`dom:checked:${out.length}:${effectiveName}`],
+        name: effectiveName,
+        parentId: '',
+        isDir: effectiveIsDir,
+        row: entry.row || null,
         resolved: false,
       });
     }
@@ -7959,7 +9035,7 @@
       const normalizedName = normalizeDomName(name);
       const checkboxInRow = getCheckboxInRow(row) || checkbox;
       const key = `${guessDomRowIsDirectory(row, name) ? 'dir' : 'file'}:${normalizedName}`;
-      if (!normalizedName || !isProbablyUsefulName(name) || seen.has(key)) {
+      if (!normalizedName || !isProbablyUsefulName(name) || isProbablyMetadataText(name) || seen.has(key)) {
         continue;
       }
 
@@ -8041,7 +9117,10 @@
   }
 
   function getPageSelectedCount() {
-    const pattern = /(?:已选(?:择)?|已勾选|selected)\s*(\d+)\s*项/iu;
+    const patterns = [
+      /(?:已选(?:择)?|已勾选|selected)\s*[：:]?\s*(\d+)\s*(?:项|个\s*(?:文件(?:\s*\/\s*文件夹)?|文件夹|项目)?|items?|files?(?:\s*\/\s*folders?)?)?/iu,
+      /(\d+)\s*(?:项|个\s*(?:文件(?:\s*\/\s*文件夹)?|文件夹|项目)?|items?|files?(?:\s*\/\s*folders?)?)\s*(?:已选(?:择)?|已勾选|selected)/iu,
+    ];
     let maxCount = 0;
     const nodes = Array.from(document.querySelectorAll('span, div, p, strong, b, em, button'));
 
@@ -8053,7 +9132,7 @@
       if (!text || text.length > 40) {
         continue;
       }
-      const matched = text.match(pattern);
+      const matched = patterns.map((pattern) => text.match(pattern)).find(Boolean);
       if (!matched) {
         continue;
       }
@@ -8069,13 +9148,128 @@
   async function collectCheckedPageSelectionPreviewItems(options = {}) {
     const onlyDirectories = Boolean(options.onlyDirectories);
     const taskControl = options.taskControl || null;
+    const disableFullSelectionFallback = Boolean(options.disableFullSelectionFallback);
+    const allowExactCapturedSelectionFallback = Boolean(options.allowExactCapturedSelectionFallback);
+    const ignorePageSelectedCount = Boolean(options.ignorePageSelectedCount);
+    const avoidSlowScrollScan = Boolean(options.avoidSlowScrollScan);
     const visibleAllItems = buildCheckedPageSelectionPreviewItems({ onlyDirectories: false });
     const visibleItems = onlyDirectories ? visibleAllItems.filter((item) => item.isDir) : visibleAllItems;
-    const pageSelectedCount = Math.max(0, Number(options.pageSelectedCount != null ? options.pageSelectedCount : getPageSelectedCount()) || 0);
+    const pageSelectedCount = ignorePageSelectedCount
+      ? 0
+      : Math.max(0, Number(options.pageSelectedCount != null ? options.pageSelectedCount : getPageSelectedCount()) || 0);
     const currentParentId = String(getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '').trim();
     const capturedItems = dedupeItems(getCapturedItems() || []);
     const capturedCount = capturedItems.length;
     const visibleCount = visibleAllItems.length;
+    if (pageSelectedCount > Math.max(visibleCount, 1)) {
+      await waitForUiPaint(1);
+    }
+    const frameworkSelectedAllItemsRaw = pageSelectedCount > Math.max(visibleCount, 1)
+      ? collectSelectedItemsFromPageFrameworkState({ onlyDirectories: false })
+      : [];
+    const frameworkSelectedAllItems = currentParentId
+      ? frameworkSelectedAllItemsRaw.filter((item) => !String(item?.parentId || '').trim() || String(item?.parentId || '').trim() === currentParentId)
+      : frameworkSelectedAllItemsRaw;
+    const frameworkSelectedItems = onlyDirectories
+      ? frameworkSelectedAllItems.filter((item) => item.isDir === true || shouldTreatItemAsDirectory(item))
+      : frameworkSelectedAllItems;
+    const frameworkSelectedCount = frameworkSelectedAllItems.length;
+    if (pageSelectedCount > Math.max(visibleCount, 1)) {
+      await waitForUiPaint(1);
+    }
+    const frameworkSelectionMarker = pageSelectedCount > Math.max(visibleCount, 1)
+      ? collectSelectionMarkersFromPageFrameworkState()
+      : { ids: new Set(), names: new Set() };
+    const markerMatchedCapturedAllItems = (frameworkSelectionMarker.ids.size || frameworkSelectionMarker.names.size)
+      ? capturedItems.filter((item) => itemMatchesSelectionMarkers(item, frameworkSelectionMarker))
+      : [];
+    const markerMatchedCapturedItems = onlyDirectories
+      ? markerMatchedCapturedAllItems.filter((item) => item.isDir === true || shouldTreatItemAsDirectory(item))
+      : markerMatchedCapturedAllItems;
+    const markerMatchedCapturedCount = markerMatchedCapturedAllItems.length;
+    const frameworkMarkerIdCount = frameworkSelectionMarker.ids.size;
+    const frameworkMarkerNameCount = frameworkSelectionMarker.names.size;
+    const selectionDiagnostics = pageSelectedCount > Math.max(visibleCount, 1)
+      ? `框架 ${frameworkSelectedCount} / marker id ${frameworkMarkerIdCount} / name ${frameworkMarkerNameCount} / 命中 ${markerMatchedCapturedCount}`
+      : '';
+
+    if (allowExactCapturedSelectionFallback && pageSelectedCount > 0 && capturedCount && capturedCount === pageSelectedCount) {
+      const normalizedCapturedItems = capturedItems.map((item) => ({
+        ...item,
+        resolved: true,
+      }));
+      const matchedItems = onlyDirectories
+        ? normalizedCapturedItems.filter((item) => item.isDir === true || shouldTreatItemAsDirectory(item))
+        : normalizedCapturedItems;
+      return {
+        items: matchedItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: Math.max(visibleCount, matchedItems.length),
+          partial: false,
+          source: 'captured-exact-selected-count',
+          diagnostics: selectionDiagnostics,
+          warning: onlyDirectories
+            ? `页面已选 ${pageSelectedCount} 项，且当前目录接口累计也为 ${capturedCount} 项；已优先使用光鸭接口累计列表补齐，其中可操作文件夹 ${matchedItems.length} 项。`
+            : `页面已选 ${pageSelectedCount} 项，且当前目录接口累计也为 ${capturedCount} 项；已优先使用光鸭接口累计列表补齐全部勾选项。`,
+        },
+      };
+    }
+
+    if (pageSelectedCount > 0 && frameworkSelectedCount === pageSelectedCount) {
+      const normalizedFrameworkItems = frameworkSelectedItems.map((item) => ({
+        ...item,
+        resolved: true,
+      }));
+      return {
+        items: normalizedFrameworkItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: Math.max(visibleCount, normalizedFrameworkItems.length),
+          partial: false,
+          source: 'framework-selected-state',
+          diagnostics: selectionDiagnostics,
+          warning: onlyDirectories
+            ? `页面已选 ${pageSelectedCount} 项，已直接从页面内部状态读取勾选文件夹 ${normalizedFrameworkItems.length} 项。`
+            : `页面已选 ${pageSelectedCount} 项，已直接从页面内部状态读取全部勾选项。`,
+        },
+      };
+    }
+
+    if (pageSelectedCount > 0 && markerMatchedCapturedCount === pageSelectedCount) {
+      const normalizedMarkerMatchedItems = markerMatchedCapturedItems.map((item) => ({
+        ...item,
+        resolved: true,
+      }));
+      return {
+        items: normalizedMarkerMatchedItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: Math.max(visibleCount, normalizedMarkerMatchedItems.length),
+          partial: false,
+          source: 'framework-selection-marker-captured',
+          diagnostics: selectionDiagnostics,
+          warning: onlyDirectories
+            ? `页面已选 ${pageSelectedCount} 项，已通过页面内部选中标记与当前目录累计列表匹配出 ${normalizedMarkerMatchedItems.length} 个文件夹。`
+            : `页面已选 ${pageSelectedCount} 项，已通过页面内部选中标记与当前目录累计列表匹配出全部勾选项。`,
+        },
+      };
+    }
+
+    if (pageSelectedCount > 0 && visibleCount > pageSelectedCount) {
+      const limitedItems = visibleItems.slice(0, pageSelectedCount);
+      return {
+        items: limitedItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount,
+          partial: false,
+          source: 'visible-limited',
+          diagnostics: selectionDiagnostics,
+          warning: `页面显示已选 ${pageSelectedCount} 项，但脚本识别到 ${visibleCount} 个疑似勾选项；已按页面已选数量截断，避免误导出全目录。`,
+        },
+      };
+    }
 
     if (!pageSelectedCount || visibleCount >= pageSelectedCount) {
       return {
@@ -8085,7 +9279,48 @@
           visibleCount,
           partial: false,
           source: 'visible',
+          diagnostics: selectionDiagnostics,
           warning: '',
+        },
+      };
+    }
+
+    if (avoidSlowScrollScan) {
+      const bestFrameworkItems = markerMatchedCapturedItems.length > frameworkSelectedItems.length
+        ? markerMatchedCapturedItems
+        : frameworkSelectedItems;
+      const recognizedItems = bestFrameworkItems.length > visibleItems.length ? bestFrameworkItems : visibleItems;
+      return {
+        items: recognizedItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: Math.max(visibleCount, frameworkSelectedCount, markerMatchedCapturedCount, recognizedItems.length),
+          partial: recognizedItems.length < pageSelectedCount,
+          source: markerMatchedCapturedItems.length > frameworkSelectedItems.length
+            ? 'framework-marker-fast-no-scroll'
+            : (frameworkSelectedCount ? 'framework-fast-no-scroll' : 'visible-fast-no-scroll'),
+          diagnostics: selectionDiagnostics,
+          warning: `页面显示已选 ${pageSelectedCount} 项；为避免长时间滚动扫描，本次先按已确认的 ${recognizedItems.length} 项处理${selectionDiagnostics ? `（${selectionDiagnostics}）` : ''}。`,
+        },
+      };
+    }
+
+    if (disableFullSelectionFallback && pageSelectedCount > 0 && frameworkSelectedCount > 0) {
+      const bestFrameworkItems = markerMatchedCapturedItems.length > frameworkSelectedItems.length
+        ? markerMatchedCapturedItems
+        : frameworkSelectedItems;
+      const recognizedItems = bestFrameworkItems.length >= visibleItems.length ? bestFrameworkItems : visibleItems;
+      return {
+        items: recognizedItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: Math.max(visibleCount, frameworkSelectedCount, markerMatchedCapturedCount, recognizedItems.length),
+          partial: recognizedItems.length < pageSelectedCount,
+          source: markerMatchedCapturedItems.length > frameworkSelectedItems.length ? 'framework-marker-fast-partial' : 'framework-fast-partial',
+          diagnostics: selectionDiagnostics,
+          warning: recognizedItems.length < pageSelectedCount
+            ? `页面显示已选 ${pageSelectedCount} 项；已优先读取页面内部勾选状态并快速确认 ${recognizedItems.length} 项，未再执行慢速滚动扫描${selectionDiagnostics ? `（${selectionDiagnostics}）` : ''}。`
+            : '',
         },
       };
     }
@@ -8108,9 +9343,49 @@
           visibleCount: scannedAllCount,
           partial: false,
           source: 'scroll-scan',
+          diagnostics: selectionDiagnostics,
           warning: onlyDirectories
             ? `页面已选 ${pageSelectedCount} 项，已滚动扫描完整个列表；其中勾选文件夹 ${scannedItems.length} 项。`
             : `页面已选 ${pageSelectedCount} 项，已滚动扫描完整个列表并补齐全部勾选项。`,
+        },
+      };
+    }
+
+    if (allowExactCapturedSelectionFallback && capturedCount && capturedCount === pageSelectedCount) {
+      const normalizedCapturedItems = capturedItems.map((item) => ({
+        ...item,
+        resolved: true,
+      }));
+      const matchedItems = onlyDirectories
+        ? normalizedCapturedItems.filter((item) => item.isDir === true || shouldTreatItemAsDirectory(item))
+        : normalizedCapturedItems;
+      return {
+        items: matchedItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: Math.max(visibleCount, scannedAllCount, matchedItems.length),
+          partial: false,
+          source: 'captured-exact-selected-count',
+          diagnostics: selectionDiagnostics,
+          warning: onlyDirectories
+            ? `页面已选 ${pageSelectedCount} 项，且当前目录接口累计也为 ${capturedCount} 项；已用光鸭接口累计列表补齐，其中可操作文件夹 ${matchedItems.length} 项。`
+            : `页面已选 ${pageSelectedCount} 项，且当前目录接口累计也为 ${capturedCount} 项；已用光鸭接口累计列表补齐全部勾选项。`,
+        },
+      };
+    }
+
+    if (disableFullSelectionFallback) {
+      const recognizedItems = scannedItems.length > visibleItems.length ? scannedItems : visibleItems;
+      const recognizedCount = Math.max(visibleCount, scannedAllCount, recognizedItems.length);
+      return {
+        items: recognizedItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: recognizedCount,
+          partial: true,
+          source: 'scroll-partial-no-full-fallback',
+          diagnostics: selectionDiagnostics,
+          warning: `页面显示已选 ${pageSelectedCount} 项，但当前只确认识别到 ${recognizedCount} 项${selectionDiagnostics ? `（${selectionDiagnostics}）` : ''}；已关闭“按全目录补齐”，避免误导出当前目录全部文件。`,
         },
       };
     }
@@ -8130,6 +9405,7 @@
           visibleCount,
           partial: false,
           source: 'captured-all-current-dir',
+          diagnostics: selectionDiagnostics,
           warning: onlyDirectories
             ? `页面已选 ${pageSelectedCount} 项，已使用脚本累计识别的当前目录列表补齐；其中可操作文件夹 ${matchedItems.length} 项。`
             : `页面已选 ${pageSelectedCount} 项，已使用脚本累计识别的当前目录列表补齐全部勾选项。`,
@@ -8145,7 +9421,8 @@
           visibleCount: Math.max(visibleCount, scannedAllCount),
           partial: true,
           source: 'scroll-partial',
-          warning: `页面显示已选 ${pageSelectedCount} 项，脚本已尝试滚动扫描整页，但目前只识别到 ${Math.max(visibleCount, scannedAllCount)} 项；还没拿到当前目录 parentId，暂时无法继续补齐。`,
+          diagnostics: selectionDiagnostics,
+          warning: `页面显示已选 ${pageSelectedCount} 项，脚本已尝试滚动扫描整页，但目前只识别到 ${Math.max(visibleCount, scannedAllCount)} 项${selectionDiagnostics ? `（${selectionDiagnostics}）` : ''}；还没拿到当前目录 parentId，暂时无法继续补齐。`,
         },
       };
     }
@@ -8181,6 +9458,7 @@
             visibleCount,
             partial: false,
             source: 'all-current-dir',
+            diagnostics: selectionDiagnostics,
             warning: onlyDirectories
               ? `页面已选 ${pageSelectedCount} 项，已按“当前目录全选”补齐；其中可操作文件夹 ${normalizedFullItems.filter((item) => item.isDir === true || shouldTreatItemAsDirectory(item)).length} 项。`
               : `页面已选 ${pageSelectedCount} 项，已按“当前目录全选”自动补齐全部勾选项。`,
@@ -8195,7 +9473,8 @@
           visibleCount: Math.max(visibleCount, scannedAllCount),
           partial: true,
           source: 'scroll-partial',
-          warning: `页面显示已选 ${pageSelectedCount} 项，脚本已尝试滚动扫描整页，但目前只识别到 ${Math.max(visibleCount, scannedAllCount)} 项。请稍等列表继续加载，或上下滚动一次后再试。`,
+          diagnostics: selectionDiagnostics,
+          warning: `页面显示已选 ${pageSelectedCount} 项，脚本已尝试滚动扫描整页，但目前只识别到 ${Math.max(visibleCount, scannedAllCount)} 项${selectionDiagnostics ? `（${selectionDiagnostics}）` : ''}。请稍等列表继续加载，或上下滚动一次后再试。`,
         },
       };
     } catch (err) {
@@ -8206,7 +9485,8 @@
           visibleCount: Math.max(visibleCount, scannedAllCount),
           partial: true,
           source: 'scroll-partial',
-          warning: `页面显示已选 ${pageSelectedCount} 项，滚动扫描后识别到 ${Math.max(visibleCount, scannedAllCount)} 项；继续补齐失败：${getErrorText(err) || '未知错误'}。`,
+          diagnostics: selectionDiagnostics,
+          warning: `页面显示已选 ${pageSelectedCount} 项，滚动扫描后识别到 ${Math.max(visibleCount, scannedAllCount)} 项${selectionDiagnostics ? `（${selectionDiagnostics}）` : ''}；继续补齐失败：${getErrorText(err) || '未知错误'}。`,
         },
       };
     }
@@ -8263,13 +9543,1254 @@
     }
   }
 
-  function resolveCheckedMoveItemsByName(previewItems, sourceItems) {
-    const exactMap = new Map();
+  function renderDirectDownloadList() {
+    if (!UI.directDownloadList || !UI.directDownloadCount || !UI.directDownloadSummary) {
+      return;
+    }
 
-    for (const item of sourceItems || []) {
-      if (!item || !item.fileId || String(item.fileId).startsWith('dom:')) {
+    const items = Array.isArray(STATE.directDownloadPreviewItems) ? STATE.directDownloadPreviewItems : [];
+    const expectedCount = Math.max(0, Number(STATE.directDownloadExpectedCount || 0));
+    const warning = String(STATE.directDownloadWarning || '').trim();
+    const summary = STATE.lastDirectDownloadSummary || null;
+    const failedCount = Math.max(0, Number(summary?.failedCount || 0));
+    const failedSample = getDirectDownloadFailureSample(summary?.failedItems || []);
+    UI.directDownloadCount.textContent =
+      expectedCount > items.length
+        ? `待下载 ${items.length}/${expectedCount} 项`
+        : `待下载 ${Math.max(items.length, expectedCount)} 项`;
+    UI.directDownloadSummary.textContent = summary
+      ? `${summary.mode === 'triggered' ? '已触发浏览器/下载器任务' : '已生成直链'} ${summary.linkCount || 0} ${summary.mode === 'triggered' ? '个' : '条'}，总大小 ${summary.formattedTotalSize || '0 B'}${failedCount ? `；另有 ${failedCount} 项取链失败` : ''}${failedSample ? `；示例：${failedSample}` : ''}${summary.mode === 'triggered' ? '。' : '；点“下载勾选”会触发浏览器下载。'}`
+      : '请先打开文件夹后勾选里面的文件；点“读取当前勾选并展开”后，这里会显示最终要下载的文件列表。';
+
+    if (!items.length) {
+      UI.directDownloadList.innerHTML = `
+        ${warning ? `<div class="gyp-import-empty">${escapeHtml(warning)}</div>` : ''}
+        <div class="gyp-import-empty">请先打开文件夹后勾选里面的文件；点“读取当前勾选并展开”后，这里会显示最终要下载的文件列表。</div>
+      `;
+      return;
+    }
+
+    UI.directDownloadList.innerHTML = `
+      ${warning ? `<div class="gyp-import-empty">${escapeHtml(warning)}</div>` : ''}
+      ${failedCount ? `<div class="gyp-import-empty">最近有 ${failedCount} 项取链失败。${failedSample ? `示例：${escapeHtml(failedSample)}` : ''} 如果“源已修改”较多，建议把下面的“每批并发取链数”降到 1 或 2 后重试。</div>` : ''}
+      ${items.map((item) => `
+      <div class="gyp-import-row">
+        <div class="gyp-import-name" title="${escapeHtml(String(item.path || item.name || ''))}">${escapeHtml(String(item.path || item.name || ''))}</div>
+        <div class="gyp-import-meta">${item.isDir ? '文件夹' : '文件'} | ${item.fileId ? `fileId: ${escapeHtml(String(item.fileId || ''))}` : '未识别 fileId'}${item.sizeText ? ` | ${escapeHtml(item.sizeText)}` : ''}${item.md5 ? ` | MD5: ${escapeHtml(item.md5)}` : ''}</div>
+      </div>
+      `).join('')}
+    `;
+  }
+
+  function setDirectDownloadPreview(items = [], meta = {}) {
+    STATE.directDownloadPreviewItems = (items || []).filter(Boolean).map((item) => {
+      const size = normalizeMiaochuanInteger(item.size ?? item.fileSize ?? item.bytes);
+      const sizeRaw = getGuangyaDirectFileSizeText(item) || String(size || 0);
+      const hash = getGuangyaDirectFileHashInfo(item);
+      return {
+        fileId: String(item.fileId || ''),
+        name: String(item.name || ''),
+        path: String(item.path || item.name || ''),
+        isDir: item.isDir === true,
+        parentId: String(item.parentId || ''),
+        dirId: String(item.dirId || item.fileId || ''),
+        dirIdCandidates: normalizeIdCandidates(item.dirIdCandidates || [item.dirId, item.fileId]),
+        size: size == null ? 0 : size,
+        sizeRaw,
+        sizeText: formatMiaochuanBytes(size || 0),
+        md5: hash.value,
+        hashSource: hash.source,
+        hashKind: hash.kind,
+      };
+    });
+    STATE.directDownloadExpectedCount = Math.max(0, Number(meta.expectedCount || 0));
+    STATE.directDownloadWarning = String(meta.warning || '');
+    if (!meta.preserveSummary) {
+      STATE.lastDirectDownloadSummary = null;
+    }
+    renderDirectDownloadList();
+    if (UI.directDownloadDetails) {
+      UI.directDownloadDetails.open = true;
+    }
+  }
+
+  function clearDirectDownloadPanel() {
+    STATE.directDownloadPreviewItems = [];
+    STATE.directDownloadExpectedCount = 0;
+    STATE.directDownloadWarning = '';
+    STATE.lastDirectDownloadSummary = null;
+    renderDirectDownloadList();
+    updatePanelStatus('已清空批量直链下载结果');
+  }
+
+  function getDirectDownloadExportFormat() {
+    return normalizeDirectDownloadExportFormat(
+      UI.fields.directDownloadExportFormat?.value || CONFIG.download.exportFormat || 'aria2'
+    );
+  }
+
+  function getDirectDownloadExportMimeType(format) {
+    return 'text/plain;charset=utf-8';
+  }
+
+  function getDirectDownloadExportFilename(format) {
+    const normalizedFormat = normalizeDirectDownloadExportFormat(format);
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+    return `光鸭批量直链_${normalizedFormat}_${stamp}.txt`;
+  }
+
+  function getDirectDownloadMd5SizeFilename() {
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+    return `光鸭勾选文件_MD5_Size_${stamp}.json`;
+  }
+
+  function getGuangyaDirectFileRaw(item) {
+    return item?.raw && typeof item.raw === 'object' ? item.raw : (item && typeof item === 'object' ? item : {});
+  }
+
+  function normalizeGuangyaSizeText(value) {
+    if (value == null || value === '') {
+      return '';
+    }
+    const text = String(value).trim();
+    if (/^\d+$/u.test(text)) {
+      return text.replace(/^0+(?=\d)/u, '') || '0';
+    }
+    const normalized = normalizeMiaochuanInteger(value);
+    return normalized == null ? '' : String(normalized);
+  }
+
+  function isDeniedGuangyaHashKey(key = '') {
+    const text = String(key || '');
+    if (/^gcid$/iu.test(text)) {
+      return false;
+    }
+    return /(url|link|path|name|token|sign|proof|request|session|cookie|auth|id)$/iu.test(text);
+  }
+
+  function isLikelyGuangyaMd5Key(key = '') {
+    const text = String(key || '').toLowerCase();
+    if (!text || isDeniedGuangyaHashKey(text)) {
+      return false;
+    }
+    return /(gcid|md5|etag|hash|digest|checksum)/iu.test(text) && !/(sha1|sha256|sha512)/iu.test(text);
+  }
+
+  function normalizeGuangyaMd5FieldValue(value, key = '') {
+    const keyText = String(key || '');
+    const text = String(value == null ? '' : value).trim().replace(/^"+|"+$/g, '');
+    if (/^gcid$/iu.test(keyText) && /^[a-f0-9]{40}$/iu.test(text)) {
+      return text.toUpperCase();
+    }
+    const direct = decodeMiaochuanMd5Token(value);
+    if (direct) {
+      return direct;
+    }
+    if (/(md5|etag)/iu.test(keyText)) {
+      return normalizeMiaochuanMd5(value);
+    }
+    return '';
+  }
+
+  function getGuangyaHashKind(key = '') {
+    return /^gcid$/iu.test(String(key || '')) ? 'gcid' : 'md5';
+  }
+
+  function findGuangyaMd5Candidate(node, options = {}) {
+    const seen = options.seen || new WeakSet();
+    const depth = Number(options.depth || 0);
+    const path = Array.isArray(options.path) ? options.path : [];
+    if (!node || typeof node !== 'object' || depth > 7) {
+      return null;
+    }
+    if (seen.has(node)) {
+      return null;
+    }
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (let index = 0; index < node.length; index += 1) {
+        const found = findGuangyaMd5Candidate(node[index], {
+          seen,
+          depth: depth + 1,
+          path: [...path, String(index)],
+        });
+        if (found) {
+          return found;
+        }
+      }
+      return null;
+    }
+
+    const contentHashName = getMiaochuanFieldValue(node, ['content_hash_name', 'contentHashName', 'hashType', 'hash_type']);
+    const contentHash = getMiaochuanFieldValue(node, ['content_hash', 'contentHash']);
+    if (contentHash.key && String(contentHashName.value || '').toLowerCase() === 'md5') {
+      const md5 = normalizeGuangyaMd5FieldValue(contentHash.value, contentHash.key);
+      if (md5) {
+        return {
+          value: md5,
+          key: contentHash.key,
+          path: [...path, contentHash.key].join('.'),
+          kind: getGuangyaHashKind(contentHash.key),
+        };
+      }
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      if (!isLikelyGuangyaMd5Key(key)) {
         continue;
       }
+      const md5 = normalizeGuangyaMd5FieldValue(value, key);
+      if (md5) {
+        return {
+          value: md5,
+          key,
+          path: [...path, key].join('.'),
+          kind: getGuangyaHashKind(key),
+        };
+      }
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      if (!value || typeof value !== 'object' || isDeniedGuangyaHashKey(key)) {
+        continue;
+      }
+      const found = findGuangyaMd5Candidate(value, {
+        seen,
+        depth: depth + 1,
+        path: [...path, key],
+      });
+      if (found) {
+        return found;
+      }
+    }
+
+    return null;
+  }
+
+  function isLikelyGuangyaSizeKey(key = '') {
+    const text = String(key || '').toLowerCase();
+    return /(size|bytes|length)$/iu.test(text) && !/(page|total|count|chunk|block|part|limit)/iu.test(text);
+  }
+
+  function findGuangyaSizeCandidate(node, options = {}) {
+    const seen = options.seen || new WeakSet();
+    const depth = Number(options.depth || 0);
+    const path = Array.isArray(options.path) ? options.path : [];
+    if (!node || typeof node !== 'object' || depth > 7) {
+      return null;
+    }
+    if (seen.has(node)) {
+      return null;
+    }
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (let index = 0; index < node.length; index += 1) {
+        const found = findGuangyaSizeCandidate(node[index], {
+          seen,
+          depth: depth + 1,
+          path: [...path, String(index)],
+        });
+        if (found) {
+          return found;
+        }
+      }
+      return null;
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      if (!isLikelyGuangyaSizeKey(key)) {
+        continue;
+      }
+      const size = normalizeGuangyaSizeText(value);
+      if (size) {
+        return {
+          value: size,
+          key,
+          path: [...path, key].join('.'),
+        };
+      }
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      if (!value || typeof value !== 'object' || isDeniedGuangyaHashKey(key)) {
+        continue;
+      }
+      const found = findGuangyaSizeCandidate(value, {
+        seen,
+        depth: depth + 1,
+        path: [...path, key],
+      });
+      if (found) {
+        return found;
+      }
+    }
+
+    return null;
+  }
+
+  function getGuangyaDirectFileHashInfo(item, options = {}) {
+    const raw = getGuangyaDirectFileRaw(item);
+    const picked = getMiaochuanFieldValue(raw, [
+      'gcid',
+      'md5',
+      'fileMd5',
+      'file_md5',
+      'etag',
+      'contentMd5',
+      'content_md5',
+      'resMd5',
+      'res_md5',
+      'resourceMd5',
+      'resource_md5',
+      'fileHash',
+      'file_hash',
+      'resHash',
+      'res_hash',
+      'resourceHash',
+      'resource_hash',
+      'hash',
+      'digest',
+      'checksum',
+    ]);
+    const direct = normalizeGuangyaMd5FieldValue(picked.value, picked.key)
+      || normalizeGuangyaMd5FieldValue(item?.gcid, 'gcid')
+      || normalizeGuangyaMd5FieldValue(item?.md5, 'md5')
+      || normalizeGuangyaMd5FieldValue(item?.etag, 'etag')
+      || normalizeGuangyaMd5FieldValue(item?.hash, 'hash');
+    if (direct) {
+      const key = picked.key || (item?.gcid ? 'gcid' : (item?.md5 ? 'md5' : (item?.etag ? 'etag' : 'hash')));
+      return {
+        value: direct,
+        source: key,
+        kind: getGuangyaHashKind(key),
+      };
+    }
+    if (options.deepScan === false) {
+      return {
+        value: '',
+        source: '',
+        kind: '',
+      };
+    }
+    const nested = findGuangyaMd5Candidate(raw);
+    return {
+      value: nested?.value || '',
+      source: nested?.path || nested?.key || '',
+      kind: nested?.kind || (nested?.key ? getGuangyaHashKind(nested.key) : ''),
+    };
+  }
+
+  function getGuangyaDirectFileMd5(item) {
+    return getGuangyaDirectFileHashInfo(item).value || '';
+  }
+
+  function getGuangyaDirectFileSizeText(item, options = {}) {
+    const raw = getGuangyaDirectFileRaw(item);
+    const picked = getMiaochuanFieldValue(raw, [
+      'size',
+      'fileSize',
+      'file_size',
+      'resSize',
+      'res_size',
+      'resourceSize',
+      'resource_size',
+      'bytes',
+      'length',
+    ]);
+    const direct = normalizeGuangyaSizeText(picked.value)
+      || normalizeGuangyaSizeText(item?.sizeRaw)
+      || normalizeGuangyaSizeText(item?.size)
+      || normalizeGuangyaSizeText(item?.fileSize)
+      || normalizeGuangyaSizeText(item?.bytes);
+    if (direct || options.deepScan === false) {
+      return direct || '';
+    }
+    return findGuangyaSizeCandidate(raw)?.value || '';
+  }
+
+  function buildDirectDownloadMd5SizePayload(files = []) {
+    const rows = (files || []).filter(Boolean).map((file) => {
+      const sizeText = getGuangyaDirectFileSizeText(file);
+      const hash = getGuangyaDirectFileHashInfo(file);
+      return {
+        path: String(file.path || file.name || '').replace(/^\/+/, ''),
+        name: String(file.name || ''),
+        fileId: String(file.fileId || ''),
+        md5: hash.value,
+        hashSource: hash.source,
+        hashKind: hash.kind,
+        size: sizeText,
+      };
+    });
+    const missingMd5 = rows.filter((row) => !row.md5).length;
+    const missingSize = rows.filter((row) => !row.size).length;
+    return {
+      source: 'guangyapan-current-file-list',
+      note: 'md5 字段优先导出光鸭 get_file_list 的 gcid；若拿到传统 32 位 MD5/etag 也会导出。size 来自光鸭 fileSize/size 字段，不来自夸克、分享链接或直链下载 URL。',
+      generatedAt: new Date().toISOString(),
+      count: rows.length,
+      missingMd5,
+      missingSize,
+      files: rows,
+    };
+  }
+
+  async function getGuangyaDownloadMetadataByFileId(fileId) {
+    const normalizedFileId = String(fileId || '').trim();
+    if (!normalizedFileId) {
+      return { md5: '', size: '', payload: null };
+    }
+    try {
+      const response = await postJson(getDownloadUrl(), { fileId: normalizedFileId }, getRequestHeaders());
+      const payload = response.payload || {};
+      if (!response.ok || !isProbablySuccess(payload, response)) {
+        return { md5: '', size: '', payload };
+      }
+      return {
+        md5: getGuangyaDirectFileMd5({ raw: payload }),
+        size: getGuangyaDirectFileSizeText({ raw: payload }),
+        payload,
+      };
+    } catch (err) {
+      warn('读取光鸭下载元数据失败：', err);
+      return { md5: '', size: '', payload: null };
+    }
+  }
+
+  async function enrichDirectDownloadMd5SizePayload(payload, options = {}) {
+    const taskControl = options.taskControl || null;
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const files = Array.isArray(payload?.files) ? payload.files : [];
+    const needs = files.filter((row) => row && row.fileId && (!row.md5 || !row.size));
+    if (!needs.length) {
+      return payload;
+    }
+
+    for (let index = 0; index < needs.length; index += 1) {
+      await waitForTaskControl(taskControl);
+      const row = needs[index];
+      if (onProgress) {
+        onProgress({
+          visible: true,
+          percent: Math.min(95, Math.round((index / Math.max(1, needs.length)) * 100)),
+          indeterminate: false,
+          text: `正在从光鸭接口补齐 MD5/Size：${index + 1}/${needs.length} | ${shortDisplayName(row.path || row.name, 42)}`,
+        });
+      }
+      const meta = await getGuangyaDownloadMetadataByFileId(row.fileId);
+      if (!row.md5 && meta.md5) {
+        row.md5 = meta.md5;
+        row.hashSource = row.hashSource || 'get_res_download_url';
+        row.hashKind = row.hashKind || (meta.md5.length === 40 ? 'gcid' : 'md5');
+      }
+      if (!row.size && meta.size) {
+        row.size = meta.size;
+      }
+    }
+
+    payload.missingMd5 = files.filter((row) => !row.md5).length;
+    payload.missingSize = files.filter((row) => !row.size).length;
+    payload.note = `${payload.note} 若列表字段缺失，已额外尝试读取光鸭 get_res_download_url 响应 payload 中的元数据；未解析签名 URL 字符串。`;
+    return payload;
+  }
+
+  function formatDirectDownloadEntries(entries = [], format = 'aria2') {
+    const normalizedFormat = normalizeDirectDownloadExportFormat(format);
+    const rows = (entries || []).filter((entry) => String(entry?.url || '').trim());
+    if (!rows.length) {
+      return '';
+    }
+
+    if (normalizedFormat === 'url') {
+      return rows.map((entry) => String(entry.url || '').trim()).join('\n');
+    }
+
+    return rows.map((entry) => {
+      const url = String(entry.url || '').trim();
+      const outPath = String(entry.outPath || entry.path || entry.name || '').replace(/^\/+/, '').trim();
+      const segments = getMiaochuanPathSegments(outPath);
+      const fileName = segments.pop() || String(entry.name || '').trim();
+      const dir = segments.join('/');
+      const bits = [url];
+      if (dir) {
+        bits.push(`  dir=${dir}`);
+      }
+      if (fileName) {
+        bits.push(`  out=${fileName}`);
+      }
+      return bits.join('\n');
+    }).join('\n\n');
+  }
+
+  function refreshDirectDownloadOutputFromSummary(options = {}) {
+    const summary = STATE.lastDirectDownloadSummary || null;
+    if (!summary) {
+      return '';
+    }
+    const format = getDirectDownloadExportFormat();
+    const text = formatDirectDownloadEntries(summary.entries || [], format);
+    summary.exportFormat = format;
+    summary.text = text;
+    summary.exportFilename = getDirectDownloadExportFilename(format);
+    if (!options.skipRender) {
+      renderDirectDownloadList();
+    }
+    return text;
+  }
+
+  function getPreparedDirectDownloadFiles() {
+    return (STATE.directDownloadPreviewItems || []).filter((item) => item && !item.isDir && item.fileId).map((item) => ({
+      fileId: String(item.fileId || ''),
+      name: String(item.name || ''),
+      path: String(item.path || item.name || ''),
+      size: Number(item.size || 0),
+      sizeRaw: String(item.sizeRaw || ''),
+      sizeText: String(item.sizeText || ''),
+      md5: String(item.md5 || ''),
+      hashSource: String(item.hashSource || ''),
+      hashKind: String(item.hashKind || ''),
+      parentId: String(item.parentId || ''),
+    }));
+  }
+
+  function getDirectDownloadItemSize(item) {
+    const size = normalizeMiaochuanInteger(
+      item?.size
+      ?? item?.fileSize
+      ?? item?.raw?.fileSize
+      ?? item?.raw?.size
+      ?? item?.raw?.bytes
+      ?? item?.raw?.resourceSize
+    );
+    return size == null ? 0 : size;
+  }
+
+  function getDirectoryTraversalIdCandidates(item) {
+    const raw = item && item.raw && typeof item.raw === 'object' ? item.raw : {};
+    const parentId = String(item?.parentId || raw.parentId || raw.parent_id || '').trim();
+    const preferred = normalizeIdCandidates([
+      raw.fileId,
+      raw.id,
+      raw.resourceId,
+      raw.resId,
+      raw.bizId,
+      raw.objId,
+      raw.shareFileId,
+      raw.share_file_id,
+      raw.folderId,
+      raw.folder_id,
+      item?.fileId,
+      raw.dirId,
+      raw.dir_id,
+      item?.dirId,
+      ...(Array.isArray(item?.dirIdCandidates) ? item.dirIdCandidates : []),
+    ]);
+
+    if (!parentId || preferred.length <= 1) {
+      return preferred;
+    }
+
+    const withoutParent = preferred.filter((id) => String(id || '').trim() !== parentId);
+    return withoutParent.length ? [...withoutParent, parentId] : preferred;
+  }
+
+  function buildDirectoryRowEntryFromItem(item) {
+    const row = item?.row;
+    if (!row || !isUsableListRow(row)) {
+      return null;
+    }
+    return {
+      row,
+      name: String(item?.name || ''),
+      normalizedName: normalizeDomName(item?.name || ''),
+      checkbox: getCheckboxInRow(row),
+      isDir: true,
+    };
+  }
+
+  async function collectDirectDownloadFilesByDirectoryNavigation(item, options = {}) {
+    const taskControl = options.taskControl || null;
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const expectedName = String(item?.name || '').trim();
+    const previousSnapshot = getDirectoryContextSnapshot();
+    const rowEntry = options.rowEntry || buildDirectoryRowEntryFromItem(item);
+
+    if (!expectedName) {
+      return {
+        files: [],
+        warning: '',
+      };
+    }
+
+    if (onProgress) {
+      onProgress({
+        visible: true,
+        percent: 0,
+        indeterminate: true,
+        text: `正在通过页面打开文件夹：${shortDisplayName(expectedName, 42)}`,
+      });
+    }
+
+    const openedSnapshot = await openDirectoryByName(expectedName, {
+      previousSnapshot,
+      childItem: item,
+      rowEntry,
+      timeoutMs: 4800,
+      maxRounds: 28,
+    });
+    if (!openedSnapshot) {
+      return {
+        files: [],
+        warning: '',
+      };
+    }
+
+    await sleep(520);
+
+    let childItems = [];
+    let requestError = null;
+    const openedParentId = String(openedSnapshot.parentId || getCurrentListContext().parentId || '').trim();
+    const visibleRows = collectVisibleListRowEntries();
+    const visibleRowItems = buildNormalizedItemsFromVisibleRows(visibleRows);
+
+    if (openedParentId) {
+      try {
+        childItems = await fetchCurrentList({
+          parentId: openedParentId,
+          pageSize: Math.max(100, Number(UI.fields.pageSize?.value || CONFIG.request.manualListBody.pageSize || 100)),
+        });
+      } catch (err) {
+        requestError = err;
+      }
+    }
+
+    const snapshotItems = openedParentId ? buildCurrentDirectoryItemsSnapshot(openedParentId) : [];
+    childItems = dedupeItems([
+      ...(Array.isArray(childItems) ? childItems : []),
+      ...snapshotItems,
+      ...visibleRowItems,
+    ]);
+
+    let nested = {
+      files: [],
+      warning: '',
+    };
+    if (childItems.length) {
+      nested = await collectDirectDownloadFilesFromItems(childItems, {
+        ...options,
+        basePath: String(options.basePath || ''),
+      });
+    }
+
+    const returned = await returnToDirectorySnapshot(previousSnapshot, {
+      timeoutMs: 5000,
+      historyBackTries: 2,
+    });
+
+    const warnings = [];
+    if (requestError) {
+      warnings.push(`目录“${expectedName}”页面展开后读取列表失败：${getErrorText(requestError)}`);
+    }
+    if (!returned) {
+      warnings.push(`目录“${expectedName}”读取完成后未能自动回到原目录，请手动返回后再继续。`);
+    }
+    if (!childItems.length && !requestError) {
+      warnings.push(`目录“${expectedName}”页面展开后仍未读取到子项。`);
+    }
+    if (nested.warning) {
+      warnings.push(nested.warning);
+    }
+
+    return {
+      files: nested.files || [],
+      warning: warnings.join('；'),
+    };
+  }
+
+  function buildDirectDownloadEntryFromResolvedUrl(file, direct = {}) {
+    return {
+      ...file,
+      url: String(direct.url || '').trim(),
+      requestId: String(direct.requestId || '').trim(),
+      outPath: String(file.path || file.name || '').replace(/^\/+/, ''),
+    };
+  }
+
+  function isRetryableDirectDownloadLinkError(err) {
+    const text = getErrorText(err);
+    if (!text) {
+      return false;
+    }
+    return /源已修改|源文件已修改|文件已修改|链接已失效|签名|过期|expired|timeout|timed out|network|fetch failed|http 5\d{2}|网关|稍后重试/iu.test(text);
+  }
+
+  function formatDirectDownloadFailure(file, err) {
+    return {
+      fileId: String(file?.fileId || ''),
+      name: String(file?.path || file?.name || file?.fileId || '').trim(),
+      message: getErrorText(err) || '未知错误',
+    };
+  }
+
+  function getDirectDownloadFailureSample(failedItems = [], max = 3) {
+    return (failedItems || [])
+      .filter(Boolean)
+      .slice(0, max)
+      .map((item) => `${shortDisplayName(item.name || item.fileId || '未命名文件', 28)}：${item.message || '未知错误'}`)
+      .join('；');
+  }
+
+  async function resolveDirectDownloadBatch(batch = [], options = {}) {
+    const taskControl = options.taskControl || null;
+    const allowRetry = options.allowRetry !== false;
+    const retryDelayMs = Math.max(200, Number(options.retryDelayMs ?? 450));
+    const orderedEntries = new Array(batch.length).fill(null);
+    const retryQueue = [];
+    const failed = [];
+
+    const firstPass = await Promise.all((batch || []).map(async (file, index) => {
+      try {
+        const direct = await getDirectDownloadLinkByFileId(file.fileId);
+        return {
+          index,
+          ok: true,
+          entry: buildDirectDownloadEntryFromResolvedUrl(file, direct),
+        };
+      } catch (err) {
+        return {
+          index,
+          ok: false,
+          file,
+          error: err,
+        };
+      }
+    }));
+
+    for (const item of firstPass) {
+      if (item?.ok && item.entry) {
+        orderedEntries[item.index] = item.entry;
+        continue;
+      }
+      if (allowRetry && isRetryableDirectDownloadLinkError(item?.error)) {
+        retryQueue.push(item);
+      } else {
+        failed.push(formatDirectDownloadFailure(item?.file, item?.error));
+      }
+    }
+
+    for (const item of retryQueue) {
+      await waitForTaskControl(taskControl);
+      await controlledDelay(retryDelayMs, taskControl);
+      try {
+        const direct = await getDirectDownloadLinkByFileId(item.file.fileId);
+        orderedEntries[item.index] = buildDirectDownloadEntryFromResolvedUrl(item.file, direct);
+      } catch (err) {
+        failed.push(formatDirectDownloadFailure(item.file, err));
+      }
+    }
+
+    return {
+      entries: orderedEntries.filter(Boolean),
+      failed,
+    };
+  }
+
+  async function getDirectDownloadLinkByFileId(fileId) {
+    const normalizedFileId = String(fileId || '').trim();
+    if (!normalizedFileId) {
+      throw new Error('缺少 fileId，无法获取下载直链。');
+    }
+    const response = await postJson(getDownloadUrl(), { fileId: normalizedFileId }, getRequestHeaders());
+    if (!response.ok || !isProbablySuccess(response.payload, response)) {
+      throw new Error(`获取下载直链失败：${getErrorText(response.payload || response.text || `HTTP ${response.status}`)}`);
+    }
+    const payload = response.payload || {};
+    const downloadUrl = String(
+      findFirstValueByKeys(payload, ['signedURL', 'signedUrl', 'downloadUrl', 'download_url', 'url'])
+      || ''
+    ).trim();
+    if (!downloadUrl) {
+      throw new Error('接口返回成功，但没有拿到下载直链 URL。');
+    }
+    return {
+      url: downloadUrl,
+      requestId: String(findFirstValueByKeys(payload, ['requestId', 'request_id']) || '').trim(),
+      payload,
+    };
+  }
+
+  async function collectDirectDownloadFilesFromItems(items, options = {}) {
+    const taskControl = options.taskControl || null;
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const queue = (items || []).filter(Boolean).map((item) => ({
+      item,
+      parentPath: String(options.basePath || ''),
+    }));
+    const files = [];
+    const seenFileIds = new Set();
+    const visitedDirs = new Set();
+    const warnings = [];
+    let processedCount = 0;
+
+    while (queue.length) {
+      await waitForTaskControl(taskControl);
+      if (processedCount > 0 && processedCount % 12 === 0) {
+        await waitForUiPaint(1);
+      }
+      const current = queue.shift();
+      const item = current.item || {};
+      const itemName = sanitizeCloudDirName(item.name, item.isDir ? '未命名目录' : '未命名文件');
+      const currentPath = `${current.parentPath}/${itemName}`.replace(/\/{2,}/g, '/');
+      const isDir = item.isDir === true || shouldTreatItemAsDirectory(item);
+      processedCount += 1;
+
+      if (onProgress) {
+        onProgress({
+          visible: true,
+          percent: 0,
+          indeterminate: true,
+          text: isDir
+            ? `正在展开文件夹：${currentPath || itemName} | 已展开文件 ${files.length} 项`
+            : `正在整理文件：${currentPath || itemName} | 已展开文件 ${files.length} 项`,
+        });
+      }
+
+      if (!isDir) {
+        const fileId = String(item.fileId || '').trim();
+        if (!fileId || seenFileIds.has(fileId)) {
+          continue;
+        }
+        const size = getDirectDownloadItemSize(item);
+        const hash = getGuangyaDirectFileHashInfo(item, {
+          deepScan: false,
+        });
+        seenFileIds.add(fileId);
+        files.push({
+          fileId,
+          name: itemName,
+          path: currentPath,
+          size,
+          sizeRaw: getGuangyaDirectFileSizeText(item, {
+            deepScan: false,
+          }) || String(size || 0),
+          md5: hash.value,
+          hashSource: hash.source,
+          hashKind: hash.kind,
+          parentId: String(item.parentId || ''),
+        });
+        if (files.length > DIRECT_DOWNLOAD_MAX_FILES) {
+          throw new Error(`待下载文件过多，已超过安全上限 ${DIRECT_DOWNLOAD_MAX_FILES} 个。请缩小勾选范围后再试。`);
+        }
+        continue;
+      }
+
+      const dirIdCandidates = getDirectoryTraversalIdCandidates(item);
+      const dirKey = dirIdCandidates[0] || String(item.fileId || '').trim();
+      if (!dirKey || visitedDirs.has(dirKey)) {
+        continue;
+      }
+      visitedDirs.add(dirKey);
+      if (visitedDirs.size > DIRECT_DOWNLOAD_MAX_DIRS) {
+        throw new Error(`目录展开过多，已超过安全上限 ${DIRECT_DOWNLOAD_MAX_DIRS} 个目录。请缩小勾选范围后再试。`);
+      }
+
+      const listing = await fetchDirectoryItems(dirKey, {
+        idCandidates: dirIdCandidates,
+        pageSize: Math.max(100, Number(UI.fields.pageSize?.value || CONFIG.request.manualListBody.pageSize || 100)),
+        maxPages: DIRECT_DOWNLOAD_MAX_PAGES_PER_DIR,
+        delayMs: 0,
+        taskControl,
+      });
+      if (listing.truncated) {
+        warnings.push(`目录“${itemName}”分页过多，可能未完全展开。`);
+      }
+      if (Number(listing.cachedCount || 0) > Number(listing.fetchedCount || 0) && Number(listing.cachedCount || 0) === Number(listing.items?.length || 0)) {
+        warnings.push(`目录“${itemName}”已合并缓存列表 ${listing.cachedCount} 项。`);
+      }
+      if (!listing.items.length) {
+        const fallback = await collectDirectDownloadFilesByDirectoryNavigation(item, {
+          ...options,
+          basePath: currentPath,
+          taskControl,
+          onProgress,
+          rowEntry: buildDirectoryRowEntryFromItem(item),
+        });
+        if (fallback.warning) {
+          warnings.push(fallback.warning);
+        }
+        for (const file of fallback.files || []) {
+          const fileId = String(file?.fileId || '').trim();
+          if (!fileId || seenFileIds.has(fileId)) {
+            continue;
+          }
+          seenFileIds.add(fileId);
+          files.push(file);
+          if (files.length > DIRECT_DOWNLOAD_MAX_FILES) {
+            throw new Error(`待下载文件过多，已超过安全上限 ${DIRECT_DOWNLOAD_MAX_FILES} 个。请缩小勾选范围后再试。`);
+          }
+        }
+        continue;
+      }
+      for (const child of listing.items || []) {
+        queue.push({
+          item: child,
+          parentPath: currentPath,
+        });
+      }
+    }
+
+    return {
+      files,
+      warning: warnings.join('；'),
+    };
+  }
+
+  async function buildDirectDownloadEntries(files, options = {}) {
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const taskControl = options.taskControl || null;
+    const delayMs = Math.max(0, Number(options.delayMs != null ? options.delayMs : CONFIG.batch.delayMs || 0));
+    const batchSize = Math.max(1, Number(options.batchSize || CONFIG.download.directBatchSize || 3));
+    const exportFormat = normalizeDirectDownloadExportFormat(options.exportFormat || CONFIG.download.exportFormat);
+    const out = [];
+    const failed = [];
+    let totalSize = 0;
+
+    for (let offset = 0; offset < files.length; offset += batchSize) {
+      await waitForTaskControl(taskControl);
+      const batch = files.slice(offset, offset + batchSize);
+      if (onProgress) {
+        onProgress({
+          visible: true,
+          percent: Math.min(95, Math.round((offset / Math.max(1, files.length)) * 100)),
+          indeterminate: false,
+          text: `正在获取下载直链：${Math.min(offset + batch.length, files.length)}/${files.length} | 本批 ${batch.length} 个`,
+        });
+      }
+      const batchResult = await resolveDirectDownloadBatch(batch, {
+        taskControl,
+        allowRetry: true,
+        retryDelayMs: Math.max(350, delayMs || 300),
+      });
+      out.push(...batchResult.entries);
+      failed.push(...batchResult.failed);
+      totalSize += batchResult.entries.reduce((sum, item) => sum + Number(item.size || 0), 0);
+      if (offset + batch.length < files.length) {
+        const cooldownMs = batchResult.failed.length
+          ? Math.max(delayMs, 700)
+          : delayMs;
+        if (cooldownMs > 0) {
+          await controlledDelay(cooldownMs, taskControl);
+        }
+      }
+    }
+
+    if (!out.length && failed.length) {
+      const sample = getDirectDownloadFailureSample(failed);
+      throw new Error(`当前 ${failed.length} 项都没拿到可用直链。${sample ? `示例：${sample}` : ''}`);
+    }
+
+    return {
+      entries: out,
+      failed,
+      failedCount: failed.length,
+      totalSize,
+      formattedTotalSize: formatMiaochuanBytes(totalSize),
+      text: formatDirectDownloadEntries(out, exportFormat),
+    };
+  }
+
+  async function previewDirectDownloadSelection(options = {}) {
+    await waitForUiPaint(1);
+    const selection = await collectResolvedCheckedMoveItems({
+      onProgress: options.onProgress,
+      taskControl: options.taskControl || null,
+      allowPartialVisible: true,
+      disableFullSelectionFallback: true,
+      avoidSlowScrollScan: true,
+      allowExactCapturedSelectionFallback: true,
+      ignorePageSelectedCount: false,
+      updateMovePreview: false,
+      includeMeta: true,
+      partialUsageLabel: '批量直链下载',
+    });
+    const checkedItems = selection.items || [];
+    const expanded = await collectDirectDownloadFilesFromItems(checkedItems, {
+      onProgress: options.onProgress,
+      taskControl: options.taskControl || null,
+    });
+    if (!expanded.files.length) {
+      const checkedDirCount = checkedItems.filter((item) => item && (item.isDir === true || shouldTreatItemAsDirectory(item))).length;
+      if (checkedItems.length && checkedDirCount === checkedItems.length) {
+        throw new Error('当前勾选的是文件夹。请先打开文件夹后勾选里面的文件，再用批量直链下载。');
+      }
+      throw new Error('当前勾选里没有可直链下载的文件。请先打开文件夹后勾选里面的文件再试。');
+    }
+    const warning = [selection.meta?.warning, expanded.warning].filter(Boolean).join('；');
+    setDirectDownloadPreview(
+      expanded.files.map((file) => ({
+        ...file,
+        isDir: false,
+      })),
+      {
+        expectedCount: expanded.files.length,
+        warning,
+      }
+    );
+    updatePanelStatus(`批量直链下载已展开 ${expanded.files.length} 个文件${warning ? `；${warning}` : ''}`);
+    return expanded.files;
+  }
+
+  async function generateDirectDownloadLinksFromCheckedItems(options = {}) {
+    let files = options.reusePreview !== false ? getPreparedDirectDownloadFiles() : [];
+    if (!files.length) {
+      await waitForUiPaint(1);
+      files = await previewDirectDownloadSelection({
+        onProgress: options.onProgress,
+        taskControl: options.taskControl || null,
+      });
+    } else {
+      setDirectDownloadPreview(
+        files.map((file) => ({
+          ...file,
+          isDir: false,
+        })),
+        {
+          expectedCount: files.length,
+          warning: STATE.directDownloadWarning || '',
+          preserveSummary: false,
+        }
+      );
+    }
+    const built = await buildDirectDownloadEntries(files, {
+      onProgress: options.onProgress,
+      taskControl: options.taskControl || null,
+      exportFormat: options.exportFormat || getDirectDownloadExportFormat(),
+    });
+    STATE.lastDirectDownloadSummary = {
+      files,
+      entries: built.entries,
+      text: built.text,
+      totalSize: built.totalSize,
+      formattedTotalSize: built.formattedTotalSize,
+      linkCount: built.entries.length,
+      failedCount: built.failedCount || 0,
+      failedItems: built.failed || [],
+      mode: 'generated',
+      generatedAt: Date.now(),
+    };
+    refreshDirectDownloadOutputFromSummary();
+    const failureText = built.failedCount
+      ? `；失败 ${built.failedCount} 项${getDirectDownloadFailureSample(built.failed) ? `，示例：${getDirectDownloadFailureSample(built.failed)}` : ''}`
+      : '';
+    updatePanelStatus(`已生成批量直链 ${built.entries.length} 条，总大小 ${built.formattedTotalSize}，导出格式 ${getDirectDownloadExportFormatLabel(getDirectDownloadExportFormat())}${failureText}`);
+    return STATE.lastDirectDownloadSummary;
+  }
+
+  async function downloadDirectDownloadSelection(options = {}) {
+    const format = normalizeDirectDownloadExportFormat(options.exportFormat || getDirectDownloadExportFormat());
+    const summary = await generateDirectDownloadLinksFromCheckedItems({
+      ...options,
+      exportFormat: format,
+      reusePreview: options.reusePreview !== false,
+    });
+    const text = summary?.entries?.length
+      ? refreshDirectDownloadOutputFromSummary({ skipRender: true })
+      : '';
+    if (!text) {
+      throw new Error('当前没有可导出的直链结果。');
+    }
+    const filename = getDirectDownloadExportFilename(format);
+    downloadMiaochuanText(filename, text, getDirectDownloadExportMimeType(format));
+    updatePanelStatus(`已下载 ${summary.linkCount || 0} 条直链（${getDirectDownloadExportFormatLabel(format)}）${summary.failedCount ? `；失败 ${summary.failedCount} 项` : ''}`);
+    return {
+      count: Number(summary.linkCount || 0),
+      filename,
+      format,
+    };
+  }
+
+  async function downloadDirectDownloadMd5SizeSelection(options = {}) {
+    let files = options.reusePreview !== false ? getPreparedDirectDownloadFiles() : [];
+    if (!files.length) {
+      await waitForUiPaint(1);
+      files = await previewDirectDownloadSelection({
+        onProgress: options.onProgress,
+        taskControl: options.taskControl || null,
+      });
+    } else {
+      setDirectDownloadPreview(
+        files.map((file) => ({
+          ...file,
+          isDir: false,
+        })),
+        {
+          expectedCount: files.length,
+          warning: STATE.directDownloadWarning || '',
+          preserveSummary: false,
+        }
+      );
+    }
+
+    const payload = await enrichDirectDownloadMd5SizePayload(
+      buildDirectDownloadMd5SizePayload(files),
+      {
+        onProgress: options.onProgress,
+        taskControl: options.taskControl || null,
+      }
+    );
+    if (!payload.files.length) {
+      throw new Error('当前没有可导出的光鸭 MD5/Size 文件信息。');
+    }
+    const filename = getDirectDownloadMd5SizeFilename();
+    downloadMiaochuanText(filename, JSON.stringify(payload, null, 2), 'application/json;charset=utf-8');
+    const missingText = [
+      payload.missingMd5 ? `${payload.missingMd5} 项缺少 MD5` : '',
+      payload.missingSize ? `${payload.missingSize} 项缺少 size` : '',
+    ].filter(Boolean).join('，');
+    updatePanelStatus(`已导出 ${payload.count} 项光鸭 MD5/Size 到 ${filename}${missingText ? `；${missingText}` : ''}`);
+    return {
+      count: payload.count,
+      filename,
+      missingMd5: payload.missingMd5,
+      missingSize: payload.missingSize,
+      payload,
+    };
+  }
+
+  function triggerDirectDownloadUrl(url, filename = '') {
+    const anchor = document.createElement('a');
+    anchor.href = String(url || '');
+    if (filename) {
+      anchor.download = String(filename || '').split('/').pop() || '';
+    }
+    anchor.rel = 'noopener noreferrer';
+    anchor.referrerPolicy = 'no-referrer';
+    anchor.target = '_blank';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  }
+
+  async function triggerDirectDownloadsFromCheckedItems(options = {}) {
+    const cachedFiles = options.reusePreview !== false ? getPreparedDirectDownloadFiles() : [];
+    const files = cachedFiles.length
+      ? cachedFiles
+      : await previewDirectDownloadSelection({
+        onProgress: options.onProgress,
+        taskControl: options.taskControl || null,
+      });
+    if (!files.length) {
+      throw new Error('当前没有可触发下载的文件。');
+    }
+
+    setDirectDownloadPreview(
+      files.map((file) => ({
+        ...file,
+        isDir: false,
+      })),
+      {
+        expectedCount: files.length,
+        warning: STATE.directDownloadWarning || '',
+        preserveSummary: false,
+      }
+    );
+
+    const taskControl = options.taskControl || null;
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const delayMs = Math.max(200, Number(CONFIG.batch.delayMs || 300));
+    const batchSize = Math.max(1, Number(options.batchSize || CONFIG.download.directBatchSize || 3));
+    const entries = [];
+    const failed = [];
+    let totalSize = 0;
+
+    for (let offset = 0; offset < files.length; offset += batchSize) {
+      await waitForTaskControl(taskControl);
+      const batch = files.slice(offset, offset + batchSize);
+      if (onProgress) {
+        onProgress({
+          visible: true,
+          percent: Math.min(95, Math.round((offset / Math.max(1, files.length)) * 100)),
+          indeterminate: false,
+          text: `正在并发获取直链并交给下载器：${Math.min(offset + batch.length, files.length)}/${files.length} | 本批 ${batch.length} 个`,
+        });
+      }
+
+      const batchResult = await resolveDirectDownloadBatch(batch, {
+        taskControl,
+        allowRetry: true,
+        retryDelayMs: Math.max(450, delayMs),
+      });
+      const batchEntries = batchResult.entries;
+      entries.push(...batchEntries);
+      failed.push(...batchResult.failed);
+      totalSize += batchEntries.reduce((sum, item) => sum + Number(item.size || 0), 0);
+
+      for (const entry of batchEntries) {
+        await waitForTaskControl(taskControl);
+        triggerDirectDownloadUrl(entry.url, entry.outPath || entry.name || '');
+        await controlledDelay(120, taskControl);
+      }
+
+      if (offset + batch.length < files.length) {
+        const cooldownMs = batchResult.failed.length
+          ? Math.max(delayMs, 900)
+          : delayMs;
+        await controlledDelay(cooldownMs, taskControl);
+      }
+    }
+
+    if (!entries.length && failed.length) {
+      const sample = getDirectDownloadFailureSample(failed);
+      throw new Error(`当前 ${failed.length} 项都没拿到可用直链。${sample ? `示例：${sample}` : ''}`);
+    }
+
+    STATE.lastDirectDownloadSummary = {
+      files,
+      entries,
+      text: formatDirectDownloadEntries(entries, getDirectDownloadExportFormat()),
+      totalSize,
+      formattedTotalSize: formatMiaochuanBytes(totalSize),
+      linkCount: entries.length,
+      failedCount: failed.length,
+      failedItems: failed,
+      mode: 'triggered',
+      generatedAt: Date.now(),
+    };
+    renderDirectDownloadList();
+
+    if (onProgress) {
+      onProgress({
+        visible: true,
+        percent: 100,
+        indeterminate: false,
+        text: `已触发 ${entries.length} 个浏览器/下载器任务${failed.length ? `，失败 ${failed.length} 个` : ''}`,
+      });
+    }
+
+    const failureText = failed.length
+      ? `；仍有 ${failed.length} 项取链失败${getDirectDownloadFailureSample(failed) ? `，示例：${getDirectDownloadFailureSample(failed)}` : ''}`
+      : '';
+    updatePanelStatus(`批量直链下载已按每批 ${batchSize} 个并发取链，并触发 ${entries.length} 个浏览器/下载器任务${failureText}；下载速度和并发由用户自己的下载器控制`);
+    return {
+      count: entries.length,
+      entries,
+      failedCount: failed.length,
+      failedItems: failed,
+    };
+  }
+
+  function resolveCheckedMoveItemsByName(previewItems, sourceItems) {
+    const exactMap = new Map();
+    const looseMap = new Map();
+    const normalizedSourceItems = (sourceItems || []).filter((item) => item && item.fileId && !String(item.fileId).startsWith('dom:'));
+    const normalizeLooseName = (name) => normalizeDomName(name)
+      .replace(/[\u200B-\u200D\uFEFF]/gu, '')
+      .replace(/\s+/gu, '')
+      .replace(/(?:文件夹|folder|directory)$/iu, '');
+
+    for (const item of normalizedSourceItems) {
       const key = normalizeDomName(item.name);
       if (!key) {
         continue;
@@ -8278,7 +10799,90 @@
         exactMap.set(key, []);
       }
       exactMap.get(key).push(item);
+
+      const looseKey = normalizeLooseName(item.name);
+      if (looseKey) {
+        if (!looseMap.has(looseKey)) {
+          looseMap.set(looseKey, []);
+        }
+        looseMap.get(looseKey).push(item);
+      }
     }
+
+    const chooseCandidate = (previewItem, exactMatches = [], rowCandidates = []) => {
+      const previewIsDir = previewItem.isDir === true;
+      const filterType = (list = []) => list.filter((candidate) => {
+        const candidateIsDir = candidate.isDir === true || shouldTreatItemAsDirectory(candidate);
+        return candidateIsDir === previewIsDir;
+      });
+      const exactTypeMatched = filterType(exactMatches);
+      if (exactTypeMatched.length === 1) {
+        return exactTypeMatched[0];
+      }
+      if (exactMatches.length === 1) {
+        return exactMatches[0];
+      }
+
+      const previewName = String(previewItem.name || '');
+      const previewLoose = normalizeLooseName(previewName);
+      const rowNameMatched = (rowCandidates || []).filter((candidate) => {
+        const candidateName = String(candidate?.name || '').trim();
+        return !candidateName || !previewName || textLooksLikeExpected(candidateName, previewName) || textLooksLikeExpected(previewName, candidateName);
+      });
+      const rowTypeMatched = filterType(rowNameMatched);
+      if (rowTypeMatched.length === 1) {
+        return rowTypeMatched[0];
+      }
+      if (rowNameMatched.length === 1) {
+        return rowNameMatched[0];
+      }
+
+      const looseMatches = previewLoose ? (looseMap.get(previewLoose) || []) : [];
+      const preferredLooseCandidates = dedupeItems([...(rowCandidates || []), ...looseMatches]);
+      const looseTypeMatched = filterType(preferredLooseCandidates);
+      if (looseTypeMatched.length === 1) {
+        return looseTypeMatched[0];
+      }
+      if (preferredLooseCandidates.length === 1) {
+        return preferredLooseCandidates[0];
+      }
+
+      const fuzzyMatches = dedupeItems([...(rowCandidates || []), ...normalizedSourceItems]).filter((candidate) => {
+        const candidateName = String(candidate?.name || '');
+        if (!candidateName) {
+          return false;
+        }
+        const candidateLoose = normalizeLooseName(candidateName);
+        return (
+          textLooksLikeExpected(candidateName, previewName)
+          || textLooksLikeExpected(previewName, candidateName)
+          || (previewLoose && candidateLoose && (
+            candidateLoose === previewLoose
+            || candidateLoose.includes(previewLoose)
+            || previewLoose.includes(candidateLoose)
+          ))
+        );
+      });
+
+      const fuzzyTypeMatched = filterType(fuzzyMatches);
+      const fuzzyLooseTypeMatched = fuzzyTypeMatched.filter((candidate) => normalizeLooseName(candidate?.name || '') === previewLoose);
+      if (fuzzyLooseTypeMatched.length === 1) {
+        return fuzzyLooseTypeMatched[0];
+      }
+      if (fuzzyTypeMatched.length === 1) {
+        return fuzzyTypeMatched[0];
+      }
+
+      const fuzzyLooseMatched = fuzzyMatches.filter((candidate) => normalizeLooseName(candidate?.name || '') === previewLoose);
+      if (fuzzyLooseMatched.length === 1) {
+        return fuzzyLooseMatched[0];
+      }
+      if (fuzzyMatches.length === 1) {
+        return fuzzyMatches[0];
+      }
+
+      return null;
+    };
 
     const merged = [];
     const resolved = [];
@@ -8307,11 +10911,8 @@
 
       const key = normalizeDomName(item.name);
       const matches = key ? (exactMap.get(key) || []) : [];
-      const typeMatched = matches.filter((candidate) => {
-        const candidateIsDir = candidate.isDir === true || shouldTreatItemAsDirectory(candidate);
-        return candidateIsDir === (item.isDir === true);
-      });
-      const chosen = typeMatched.length === 1 ? typeMatched[0] : (matches.length === 1 ? matches[0] : null);
+      const rowCandidates = extractNormalizedItemsFromRow(item.row, item.name, item.isDir === true);
+      const chosen = chooseCandidate(item, matches, rowCandidates);
 
       if (chosen) {
         const normalized = {
@@ -8321,6 +10922,7 @@
           name: String(chosen.name || item.name || ''),
           parentId: String(chosen.parentId || ''),
           isDir: chosen.isDir === true || shouldTreatItemAsDirectory(chosen),
+          row: item.row || null,
           raw: chosen.raw,
           resolved: true,
         };
@@ -8334,6 +10936,7 @@
           name: String(item.name || ''),
           parentId: String(item.parentId || ''),
           isDir: item.isDir === true,
+          row: item.row || null,
           raw: item.raw,
           resolved: false,
         };
@@ -8361,6 +10964,7 @@
           name: String(item.name || ''),
           parentId: String(item.parentId || ''),
           isDir: item.isDir === true,
+          row: item.row || null,
           resolved: true,
         })),
         resolved: (previewItems || []).map((item) => ({
@@ -8371,6 +10975,7 @@
           name: String(item.name || ''),
           parentId: String(item.parentId || ''),
           isDir: item.isDir === true,
+          row: item.row || null,
           resolved: true,
         })),
         unresolved: [],
@@ -8381,6 +10986,7 @@
     const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
     const context = getCurrentListContext();
     const candidateSources = [];
+    const currentParentId = String(context.parentId || CONFIG.request.manualListBody.parentId || '').trim();
     const verifiedPageSize = Math.max(
       Number(UI.fields.pageSize?.value || 0),
       Number(CONFIG.request.manualListBody.pageSize || 0),
@@ -8399,10 +11005,16 @@
     }
 
     try {
-      const fetched = await fetchCurrentList({ pageSize: verifiedPageSize });
+      const fetched = currentParentId
+        ? (await fetchDirectoryItemsByParentId(currentParentId, {
+            pageSize: verifiedPageSize,
+            maxPages: Math.max(3, Math.ceil((previewItems.length + 60) / Math.max(1, verifiedPageSize)) + 4),
+            delayMs: 0,
+          })).items
+        : await fetchCurrentList({ pageSize: verifiedPageSize });
       if (fetched.length) {
         candidateSources.push({
-          source: 'api',
+          source: currentParentId ? 'api-paged' : 'api',
           items: fetched,
         });
       }
@@ -8449,6 +11061,7 @@
             name: String(item.name || ''),
             parentId: String(item.parentId || ''),
             isDir: item.isDir === true,
+            row: item.row || null,
             resolved: false,
           })),
           resolved: [],
@@ -8460,6 +11073,7 @@
             name: String(item.name || ''),
             parentId: String(item.parentId || ''),
             isDir: item.isDir === true,
+            row: item.row || null,
             resolved: false,
           })),
         };
@@ -8476,31 +11090,58 @@
     const selection = await collectCheckedPageSelectionPreviewItems({
       onlyDirectories: Boolean(options.onlyDirectories),
       taskControl: options.taskControl || null,
+      disableFullSelectionFallback: Boolean(options.disableFullSelectionFallback),
+      avoidSlowScrollScan: Boolean(options.avoidSlowScrollScan),
+      allowExactCapturedSelectionFallback: Boolean(options.allowExactCapturedSelectionFallback),
+      ignorePageSelectedCount: Boolean(options.ignorePageSelectedCount),
     });
     const previewItems = selection.items || [];
-    setMoveSelectionPreview(previewItems, selection.meta);
+    const updateMovePreview = options.updateMovePreview !== false;
+    if (updateMovePreview) {
+      setMoveSelectionPreview(previewItems, selection.meta);
+    }
 
     if (!previewItems.length) {
       throw new Error(options.onlyDirectories ? '当前页面没有勾选任何文件夹。' : '当前页面没有勾选任何文件或文件夹。');
     }
 
     if (selection.meta?.partial) {
-      throw new Error(
-        selection.meta.warning
-        || `页面显示已选 ${selection.meta?.expectedCount || 0} 项，但当前只能识别到 ${selection.meta?.visibleCount || previewItems.length} 项。`
-      );
+      if (!options.allowPartialVisible) {
+        throw new Error(
+          selection.meta.warning
+          || `页面显示已选 ${selection.meta?.expectedCount || 0} 项，但当前只能识别到 ${selection.meta?.visibleCount || previewItems.length} 项。`
+        );
+      }
+      selection.meta = {
+        ...selection.meta,
+        warning: `页面显示已选 ${selection.meta?.expectedCount || 0} 项，但当前只确认识别到 ${selection.meta?.visibleCount || previewItems.length} 项；本次${options.partialUsageLabel || '操作'}只处理这些已确认勾选项，不会按全目录补齐。`,
+      };
     }
 
     const ensured = await ensureCheckedMoveItemsHaveRealIds(previewItems, {
       onProgress: options.onProgress,
     });
-    setMoveSelectionPreview(ensured.mergedItems, selection.meta);
+    if (updateMovePreview) {
+      setMoveSelectionPreview(ensured.mergedItems, selection.meta);
+    }
 
     if (ensured.unresolved.length) {
       const sample = ensured.unresolved.slice(0, 6).map((item) => item.name).filter(Boolean).join('、');
       throw new Error(
         `当前有 ${ensured.unresolved.length} 个勾选项没拿到真实 fileId。请先等待当前目录列表加载完整，或刷新页面后再试。${sample ? ` 未识别示例：${sample}` : ''}`
       );
+    }
+
+    if (options.includeMeta) {
+      return {
+        items: ensured.resolved,
+        meta: {
+          ...(selection.meta || {}),
+          source: ensured.source || selection.meta?.source || 'visible',
+          resolvedCount: ensured.resolved.length,
+          unresolvedCount: ensured.unresolved.length,
+        },
+      };
     }
 
     return ensured.resolved;
@@ -8940,9 +11581,31 @@
     if (ariaChecked === 'true') {
       return true;
     }
+    if (ariaChecked === 'false') {
+      return false;
+    }
+
+    const stateAttrs = [
+      node.getAttribute?.('checked'),
+      node.getAttribute?.('data-state'),
+      node.getAttribute?.('data-selected'),
+      node.getAttribute?.('data-checked'),
+      node.getAttribute?.('aria-selected'),
+    ].map((value) => String(value || '').toLowerCase()).filter(Boolean);
+    if (stateAttrs.some((value) => ['true', 'checked', 'selected', 'on'].includes(value))) {
+      return true;
+    }
+    if (stateAttrs.some((value) => ['false', 'unchecked', 'unselected', 'off'].includes(value))) {
+      return false;
+    }
 
     const className = String(node.className || '').toLowerCase();
-    return className.includes('checked') || className.includes('selected') || className.includes('is-checked');
+    if (/(^|[\s:_-])(un|not)-?(checked|selected)([\s:_-]|$)/u.test(className)) {
+      return false;
+    }
+    return /(^|[\s:_-])(?:is-)?checked([\s:_-]|$)/u.test(className)
+      || /(^|[\s:_-])(?:is-)?selected([\s:_-]|$)/u.test(className)
+      || /(^|[\s:_-])\w+-(?:checked|selected)([\s:_-]|$)/u.test(className);
   }
 
   function isVisibleElement(node) {
@@ -10463,6 +13126,9 @@
     if (STATE.lastEmptyDirScan) {
       bits.push(`空目录 ${Number(STATE.lastEmptyDirScan.emptyDirs?.length || 0)} 个`);
     }
+    if (STATE.lastDirectDownloadSummary?.linkCount) {
+      bits.push(`直链 ${Number(STATE.lastDirectDownloadSummary.linkCount || 0)} 条${STATE.lastDirectDownloadSummary.failedCount ? ` / 失败 ${Number(STATE.lastDirectDownloadSummary.failedCount || 0)}` : ''}`);
+    }
 
     if (context.batchCount > 1) {
       bits.push(`已合并 ${context.batchCount} 批`);
@@ -10503,6 +13169,9 @@
         `磁力条数: ${magnetStats.magnetCount} 条`,
         `云添加每批: ${CONFIG.cloud.maxFilesPerTask || 500} 文件`,
         `云添加目录前缀: ${CONFIG.cloud.sourceDirPrefix || '磁力导入'}`,
+        STATE.lastDirectDownloadSummary
+          ? `最近直链下载: ${STATE.lastDirectDownloadSummary.linkCount || 0} 条 / ${STATE.lastDirectDownloadSummary.formattedTotalSize || '0 B'}${STATE.lastDirectDownloadSummary.failedCount ? ` / 失败 ${STATE.lastDirectDownloadSummary.failedCount}` : ''}`
+          : '最近直链下载: 暂无记录',
         emptyDirSummary
           ? `最近空目录扫描: 空目录 ${emptyDirSummary.emptyDirs?.length || 0} / 已扫目录 ${emptyDirSummary.scannedDirs || 0}${emptyDirSummary.truncated ? ' / 可能未扫全' : ''}`
           : '最近空目录扫描: 暂无记录',
@@ -10627,6 +13296,11 @@
       text: `正在停止 | ${baseState.text || control.label || '当前任务'}`,
     });
     updatePanelStatus(`正在停止：${control.label || '当前任务'}（会在当前步骤结束后停下）`);
+    if (typeof control.abortCurrent === 'function') {
+      try {
+        control.abortCurrent();
+      } catch {}
+    }
     return true;
   }
 
@@ -10730,6 +13404,8 @@
       cloudBatchLimit: String(CONFIG.cloud.maxFilesPerTask || 500),
       cloudDirPrefix: CONFIG.cloud.sourceDirPrefix || '磁力导入',
       moveTargetParentId: CONFIG.move.targetParentId || '',
+      directDownloadBatchSize: String(CONFIG.download.directBatchSize || 3),
+      directDownloadExportFormat: normalizeDirectDownloadExportFormat(CONFIG.download.exportFormat),
       ruleSearchText: firstRule.type === 'text' ? (firstRule.search || '') : '',
       ruleReplaceText: firstRule.type === 'text' ? (firstRule.replace || '') : '',
       addText: output.addText || '',
@@ -10820,6 +13496,9 @@
     CONFIG.cloud.maxFilesPerTask = Number.isFinite(cloudBatchLimit) && cloudBatchLimit > 0 ? Math.max(1, cloudBatchLimit) : 500;
     CONFIG.cloud.sourceDirPrefix = (UI.fields.cloudDirPrefix?.value || '磁力导入').trim() || '磁力导入';
     CONFIG.move.targetParentId = (UI.fields.moveTargetParentId?.value || '').trim();
+    const directDownloadBatchSize = Number(UI.fields.directDownloadBatchSize?.value || 3);
+    CONFIG.download.directBatchSize = Number.isFinite(directDownloadBatchSize) && directDownloadBatchSize > 0 ? Math.max(1, directDownloadBatchSize) : 3;
+    CONFIG.download.exportFormat = normalizeDirectDownloadExportFormat(UI.fields.directDownloadExportFormat?.value || CONFIG.download.exportFormat);
 
     const delayMs = Number(UI.fields.delayMs?.value || 300);
     CONFIG.batch.delayMs = Number.isFinite(delayMs) && delayMs >= 0 ? delayMs : 300;
@@ -10875,6 +13554,7 @@
       return;
     }
     [
+      'direct-download-details',
       'share-link-details',
       'miaochuan-details',
       'magnet-details',
@@ -11667,7 +14347,7 @@
               <img class="gyp-title-mark" src="https://image.868717.xyz/file/1776301692011_3.svg" alt="" aria-hidden="true" />
               <div class="gyp-title-stack">
                 <div class="gyp-title">光鸭云盘工具</div>
-                <div class="gyp-subtitle">分享直读 / 网盘互通 / 磁力云批量添加 / 移动整理 / 批量改名</div>
+                <div class="gyp-subtitle">批量直链下载 / 分享直读 / 网盘互通 / 磁力云批量添加 / 移动整理 / 批量改名</div>
                 <div class="gyp-version">Serenalee (v${SCRIPT_VERSION})</div>
               </div>
             </div>
@@ -11898,6 +14578,36 @@
               </div>
             </div>
           </details>
+          <details class="gyp-section" data-role="direct-download-details">
+            <summary>
+              <span class="gyp-section-summary">
+                <span class="gyp-section-headline">
+                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">⬇️</span><span class="gyp-section-title">批量直链下载</span></span>
+                  <span class="gyp-section-desc">展开文件夹、逐个取直链，绕过服务器打包</span>
+                </span>
+                <span class="gyp-section-badge" data-role="direct-download-count">待下载 0/0 项</span>
+              </span>
+            </summary>
+            <div class="gyp-section-body">
+              <div class="gyp-section-actions">
+                <button type="button" class="secondary" data-action="preview-direct-download-selection">读取当前勾选并展开</button>
+                <button type="button" class="secondary" data-action="trigger-direct-download-selection">下载勾选</button>
+                <button type="button" class="secondary" data-action="clear-direct-download">清空结果</button>
+                <button type="button" class="secondary" data-action="download-direct-download-md5-size">下载光鸭MD5/Size</button>
+              </div>
+              <div class="gyp-section-note">这个功能只在光鸭当前文件列表里生效。更稳的用法是先打开文件夹，再勾选里面的文件；脚本会逐个请求单文件直链，不再走 create_packaging_task 打包下载，点“下载勾选”会把直链交给浏览器或用户自己的下载器接管。</div>
+              <div class="gyp-inline-help">“源已修改”和并发有关：插件会按批次并发获取直链，拿到一批就立刻交给下载器；真正下载速度、多线程和断点续传由你自己的浏览器、IDM、NDM、Motrix 等下载器控制。</div>
+              <label class="gyp-field">
+                <span>每批并发取链数</span>
+                <input data-field="directDownloadBatchSize" placeholder="3" />
+                <div class="gyp-inline-help">默认 3。出现“源已修改”较多时，建议先降到 1 或 2，再点“下载勾选”重试。</div>
+              </label>
+              <div class="gyp-inline-help" data-role="direct-download-summary">请先打开文件夹后勾选里面的文件；点“读取当前勾选并展开”后，这里会显示最终要下载的文件列表。</div>
+              <div class="gyp-import-list" data-role="direct-download-list">
+                <div class="gyp-import-empty">请先打开文件夹后勾选里面的文件；点“读取当前勾选并展开”后，这里会显示最终要下载的文件列表。</div>
+              </div>
+            </div>
+          </details>
           <details class="gyp-section" data-role="magnet-details">
             <summary>
               <span class="gyp-section-summary">
@@ -12114,6 +14824,10 @@
     UI.moveDetails = root.querySelector('[data-role="move-details"]');
     UI.moveSelectionList = root.querySelector('[data-role="move-selection-list"]');
     UI.moveSelectionCount = root.querySelector('[data-role="move-count"]');
+    UI.directDownloadDetails = root.querySelector('[data-role="direct-download-details"]');
+    UI.directDownloadList = root.querySelector('[data-role="direct-download-list"]');
+    UI.directDownloadCount = root.querySelector('[data-role="direct-download-count"]');
+    UI.directDownloadSummary = root.querySelector('[data-role="direct-download-summary"]');
     UI.emptyDirList = root.querySelector('[data-role="empty-dir-list"]');
     UI.emptyDirCount = root.querySelector('[data-role="empty-dir-count"]');
     UI.emptyDirDetails = root.querySelector('[data-role="empty-dir-details"]');
@@ -12155,6 +14869,8 @@
     UI.fields.cloudBatchLimit = root.querySelector('[data-field="cloudBatchLimit"]');
     UI.fields.cloudDirPrefix = root.querySelector('[data-field="cloudDirPrefix"]');
     UI.fields.moveTargetParentId = root.querySelector('[data-field="moveTargetParentId"]');
+    UI.fields.directDownloadBatchSize = root.querySelector('[data-field="directDownloadBatchSize"]');
+    UI.fields.directDownloadExportFormat = root.querySelector('[data-field="directDownloadExportFormat"]');
     UI.fields.shareLinkUrl = root.querySelector('[data-field="shareLinkUrl"]');
     UI.fields.shareLinkPasscode = root.querySelector('[data-field="shareLinkPasscode"]');
     UI.fields.shareLinkQuarkCookie = root.querySelector('[data-field="shareLinkQuarkCookie"]');
@@ -12182,6 +14898,7 @@
       UI.fields.miaochuanGuangyaAuthorization.value = getStoredGuangyaAuthorization();
     }
     renderShareLinkList();
+    renderDirectDownloadList();
 
     const closePanel = () => {
       root.classList.remove('gyp-open');
@@ -12609,6 +15326,7 @@
             UI.moveDetails.open = true;
           }
           setProgressBar({ visible: false });
+          await waitForUiPaint(1);
           const selection = await collectCheckedPageSelectionPreviewItems();
           const items = selection.items || [];
           setMoveSelectionPreview(items, selection.meta);
@@ -12619,6 +15337,78 @@
           } else {
             updatePanelStatus(selection.meta?.warning || `已读取当前页面勾选 ${Math.max(items.length, Number(selection.meta?.expectedCount || 0))} 项`);
           }
+          return;
+        }
+
+        if (action === 'preview-direct-download-selection') {
+          if (UI.directDownloadDetails) {
+            UI.directDownloadDetails.open = true;
+          }
+          await runWithTaskControl('读取批量直链下载勾选', async (taskControl) => {
+            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备读取当前勾选并展开文件夹...' });
+            await waitForUiPaint(1);
+            const files = await previewDirectDownloadSelection({
+              onProgress: (state) => setProgressBar(state),
+              taskControl,
+            });
+            setProgressBar({ visible: true, percent: 100, indeterminate: false, text: `已展开待下载文件 ${files.length} 项` });
+          });
+          return;
+        }
+
+        if (action === 'trigger-direct-download-selection') {
+          if (UI.directDownloadDetails) {
+            UI.directDownloadDetails.open = true;
+          }
+          await runWithTaskControl('下载批量直链勾选', async (taskControl) => {
+            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备展开文件夹并触发浏览器下载...' });
+            await waitForUiPaint(1);
+            const result = await triggerDirectDownloadsFromCheckedItems({
+              onProgress: (state) => setProgressBar(state),
+              taskControl,
+              reusePreview: false,
+            });
+            setProgressBar({
+              visible: true,
+              percent: 100,
+              indeterminate: false,
+              text: `已触发 ${result.count} 个浏览器/下载器任务${result.failedCount ? `，失败 ${result.failedCount} 个` : ''}`,
+            });
+          });
+          return;
+        }
+
+        if (action === 'download-direct-download-md5-size') {
+          if (UI.directDownloadDetails) {
+            UI.directDownloadDetails.open = true;
+          }
+          await runWithTaskControl('下载光鸭 MD5/Size', async (taskControl) => {
+            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备读取当前勾选并导出光鸭 MD5/Size...' });
+            await waitForUiPaint(1);
+            const result = await downloadDirectDownloadMd5SizeSelection({
+              onProgress: (state) => setProgressBar(state),
+              taskControl,
+              reusePreview: false,
+            });
+            const missingText = [
+              result.missingMd5 ? `${result.missingMd5} 项缺少 MD5` : '',
+              result.missingSize ? `${result.missingSize} 项缺少 size` : '',
+            ].filter(Boolean).join('，');
+            setProgressBar({
+              visible: true,
+              percent: 100,
+              indeterminate: false,
+              text: `已导出 ${result.count} 项光鸭 MD5/Size 到 ${result.filename}${missingText ? `；${missingText}` : ''}`,
+            });
+          });
+          return;
+        }
+
+        if (action === 'clear-direct-download') {
+          if (UI.directDownloadDetails) {
+            UI.directDownloadDetails.open = true;
+          }
+          clearDirectDownloadPanel();
           return;
         }
 
@@ -12707,6 +15497,16 @@
     root.addEventListener('change', (event) => {
       if (event.target.closest('[data-field]')) {
         updateRenameModePreview();
+      }
+
+      if (event.target === UI.fields.directDownloadExportFormat) {
+        CONFIG.download.exportFormat = getDirectDownloadExportFormat();
+        savePersistedConfig();
+        if (STATE.lastDirectDownloadSummary?.entries?.length) {
+          refreshDirectDownloadOutputFromSummary();
+          updatePanelStatus(`已切换批量直链导出格式为 ${getDirectDownloadExportFormatLabel(CONFIG.download.exportFormat)}`);
+        }
+        return;
       }
 
       if (event.target === UI.magnetFileInput) {
@@ -13279,6 +16079,10 @@
     deleteEmptyDirItems,
     importMagnetTextFiles,
     listCloudTasks,
+    previewDirectDownloadSelection,
+    generateDirectDownloadLinksFromCheckedItems,
+    downloadDirectDownloadMd5SizeSelection,
+    triggerDirectDownloadsFromCheckedItems,
     readShareLinkFromPanel,
     generateMiaochuanJsonFromShareLinkSelection,
     generateMiaochuanJsonFromCapturedPage,
@@ -13294,7 +16098,7 @@
     savePersistedConfig,
   };
 
-  const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  const pageWindow = getPageWindowObject();
   pageWindow.gypBatchRenamer = api;
 
   log('脚本已加载。页面右下角会出现光鸭云盘悬浮面板，也可以在控制台运行 gypBatchRenamer.preview() / gypBatchRenamer.run() / gypBatchRenamer.deleteDuplicateItems() / gypBatchRenamer.importMagnetTextFiles() / gypBatchRenamer.scanEmptyLeafDirectories()。');
