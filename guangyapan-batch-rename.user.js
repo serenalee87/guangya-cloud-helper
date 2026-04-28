@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         光鸭云盘批量助手 V4
 // @namespace    serenalee.guangyapan.batch-helper
-// @version      0.5.71
+// @version      0.5.78
 // @description  为光鸭云盘网页端提供批量重命名、重复项清理、移动整理、磁力云添加、秒传 JSON 转换/诊断、空目录扫描与删除等功能。
 // @author       Serena Lee
 // @license      Copyright (c) 2026 Serena Lee. All rights reserved.
@@ -10,12 +10,16 @@
 // @match        https://cloud.189.cn/*
 // @match        *://*.123pan.com/*
 // @match        *://*.123pan.cn/*
+// @match        *://*.123684.cn/*
 // @match        https://www.123pan.com/*
 // @match        https://www.123pan.com/
 // @match        http://www.123pan.com/*
 // @match        https://123pan.com/*
 // @match        https://123pan.com/
 // @match        http://123pan.com/*
+// @match        https://pan.baidu.com/*
+// @match        https://yun.baidu.com/*
+// @match        https://pan.xunlei.com/*
 // @match        https://guangyapan.com/*
 // @match        https://*.guangyapan.com/*
 // @icon         https://image.868717.xyz/file/1776301692011_3.svg
@@ -36,6 +40,9 @@
 // @connect      *.123pan.com
 // @connect      *.123pan.cn
 // @connect      cloud.189.cn
+// @connect      pan.baidu.com
+// @connect      yun.baidu.com
+// @connect      api-pan.xunlei.com
 // @connect      api.guangyapan.com
 // @downloadURL https://update.greasyfork.org/scripts/574046/%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98%E6%89%B9%E9%87%8F%E5%8A%A9%E6%89%8B%20V4.user.js
 // @updateURL https://update.greasyfork.org/scripts/574046/%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98%E6%89%B9%E9%87%8F%E5%8A%A9%E6%89%8B%20V4.meta.js
@@ -44,7 +51,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.5.71';
+  const SCRIPT_VERSION = '0.5.78';
 
   // =========================
   // 用户配置区：主要改这里
@@ -105,6 +112,7 @@
         mode: 'keep-clean',
         addText: '',
         addPosition: 'suffix',
+        addIgnoreExtension: true,
         findText: '',
         replaceText: '',
         formatStyle: 'text-and-index',
@@ -136,6 +144,10 @@
           const addText = String(output.addText || '');
           if (!addText) {
             return clean;
+          }
+          const ignoreExtension = output.addIgnoreExtension !== false;
+          if (ignoreExtension && output.addPosition === 'suffix' && ext) {
+            return `${base}${addText}${ext}`;
           }
           return output.addPosition === 'prefix' ? `${addText}${clean}` : `${clean}${addText}`;
         }
@@ -208,6 +220,8 @@
   const GUANGYA_AUTH_STORAGE_KEY = '__GYP_BATCH_RENAME_GUANGYA_AUTH__';
   const GUANGYA_CODE_RES_TOKEN_INSTANT = 156;
   const GUANGYA_CODE_DIR_EXISTS = 159;
+  const XUNLEI_API_BASE = 'https://api-pan.xunlei.com';
+  const XUNLEI_CLIENT_ID = 'Xqp0kJBXWhwaTpB6';
   const DIRECT_DOWNLOAD_EXPORT_FORMATS = Object.freeze(['aria2', 'url']);
   const STATE = {
     headers: {},
@@ -244,6 +258,7 @@
     miaochuanCapturedMap: {},
     lastMiaochuanCaptureAt: 0,
     lastMiaochuanCaptureUrl: '',
+    lastXunleiHeaders: null,
     lastEmptyDirScan: null,
     activeTaskControl: null,
     lastProgressState: {
@@ -3626,6 +3641,20 @@
   }
 
   function pickMiaochuanHashValue(raw) {
+    const gcid = getMiaochuanFieldValue(raw, ['gcid']);
+    if (gcid.key) {
+      const text = String(gcid.value || '').trim();
+      if (/^[a-f0-9]{40}$/iu.test(text)) {
+        return { ...gcid, hashKind: 'gcid', supported: true };
+      }
+      return {
+        ...gcid,
+        hashKind: 'gcid',
+        supported: false,
+        reason: 'gcid 不是 40 位迅雷 GCID，不能用于光鸭 GCID 秒传',
+      };
+    }
+
     const md5Fields = [
       'etag',
       'md5',
@@ -3660,6 +3689,10 @@
     const genericHash = getMiaochuanFieldValue(raw, ['hash', 'sha1', 'fileSha1', 'file_sha1', 'quick_hash']);
     if (genericHash.key) {
       const text = String(genericHash.value || '').trim();
+      const providerText = String(raw.__gypProvider || raw.provider || raw.source || '').toLowerCase();
+      if (/xunlei|迅雷/u.test(providerText) && /^[a-f0-9]{40}$/iu.test(text)) {
+        return { ...genericHash, hashKind: 'gcid', supported: true };
+      }
       if (isExactMiaochuanMd5(text)) {
         return { ...genericHash, hashKind: 'md5-like', supported: true };
       }
@@ -3808,6 +3841,9 @@
     if (/quark\.cn$/i.test(host)) return '夸克网盘当前页面';
     if (/123pan\.(com|cn)$/i.test(host)) return '123 网盘当前页面';
     if (/189\.cn$/i.test(host)) return '天翼云盘当前页面';
+    if (isBaiduSharePage()) return '百度网盘分享页（不支持直接取 MD5）';
+    if (/(pan|yun)\.baidu\.com$/i.test(host)) return '百度网盘当前页面';
+    if (/pan\.xunlei\.com$/i.test(host)) return '迅雷云盘当前页面';
     if (/guangyapan\.com$/i.test(host)) return '光鸭云盘当前页面';
     return `${host} 当前页面`;
   }
@@ -3950,6 +3986,10 @@
       || /(^|\.)123(865|684|912)\.com$/i.test(host);
   }
 
+  function is123PanPageHost() {
+    return is123PanShareHost(window.location.hostname || '');
+  }
+
   function extract123PanShareKeyFromUrl(parsedUrl) {
     if (!parsedUrl) {
       return '';
@@ -3965,6 +4005,28 @@
     const matched = pathname.match(/\/(?:s|ps|123pan)\/([^/?#]+)/i)
       || pathname.match(/\/([A-Za-z0-9][A-Za-z0-9_-]*-[A-Za-z0-9_-]+)(?:\/|$)/);
     return matched ? String(matched[1] || '').trim() : '';
+  }
+
+  function get123PanShareKeyFromLocation() {
+    try {
+      return extract123PanShareKeyFromUrl(new URL(window.location.href || ''));
+    } catch {
+      return '';
+    }
+  }
+
+  function get123PanSharePasscodeFromLocation() {
+    try {
+      const url = new URL(window.location.href || '');
+      return url.searchParams.get('pwd')
+        || url.searchParams.get('passcode')
+        || url.searchParams.get('code')
+        || url.searchParams.get('SharePwd')
+        || '';
+    } catch {
+      const matched = String(window.location.href || '').match(/[?&#](?:pwd|passcode|code|SharePwd)=([^&#]+)/i);
+      return matched ? decodeUrlParam(matched[1]) : '';
+    }
   }
 
   function extractTianyiShareCodeFromUrl(parsedUrl) {
@@ -3985,6 +4047,20 @@
     }
     const pathMatched = decodeUrlParam(parsedUrl.pathname || '').match(/\/t\/([^/?#]+)/i);
     return pathMatched ? String(pathMatched[1] || '').trim() : '';
+  }
+
+  function extractXunleiShareIdFromUrl(parsedUrl) {
+    if (!parsedUrl) {
+      return '';
+    }
+    const direct = parsedUrl.searchParams.get('share_id')
+      || parsedUrl.searchParams.get('shareId')
+      || '';
+    if (direct) {
+      return decodeUrlParam(direct).trim();
+    }
+    const matched = decodeUrlParam(parsedUrl.pathname || '').match(/^\/s\/([^/?#]+)/i);
+    return matched ? String(matched[1] || '').trim() : '';
   }
 
   function detectShareLinkProvider(rawInput = '', options = {}) {
@@ -4053,9 +4129,9 @@
       };
     }
 
-    if (/cloud\.189\.cn$/i.test(host)) {
-      const shareCode = extractTianyiShareCodeFromUrl(parsedUrl);
-      return {
+	    if (/cloud\.189\.cn$/i.test(host)) {
+	      const shareCode = extractTianyiShareCodeFromUrl(parsedUrl);
+	      return {
         provider: 'tianyiyun',
         label: '天翼云盘分享链接',
         supported: Boolean(shareCode),
@@ -4063,6 +4139,19 @@
         passcode: String(passcode || '').trim(),
         shareCode,
         message: shareCode ? '' : '没有在链接里识别到天翼云盘分享 Code。',
+	      };
+	    }
+
+    if (/^pan\.xunlei\.com$/i.test(host)) {
+      const shareId = extractXunleiShareIdFromUrl(parsedUrl);
+      return {
+        provider: 'xunlei',
+        label: '迅雷云盘分享链接',
+        supported: Boolean(shareId),
+        shareUrl: parsedUrl.toString(),
+        passcode: String(passcode || '').trim(),
+        shareId,
+        message: shareId ? '' : '没有在链接里识别到迅雷分享 ID。',
       };
     }
 
@@ -4090,6 +4179,871 @@
       }
     }
     return getQuarkCookieForMiaochuan();
+  }
+
+  function isBaiduPageHost() {
+    return /^(pan|yun)\.baidu\.com$/i.test(window.location.hostname || '');
+  }
+
+  function isBaiduSharePage() {
+    return isBaiduPageHost() && /^\/(?:s|share)\//i.test(window.location.pathname || '');
+  }
+
+  function decodeBaiduMd5(encrypted) {
+    const text = String(encrypted || '').trim();
+    if (!text || text.length !== 32) {
+      return text.toLowerCase();
+    }
+    if (/^[a-f0-9]{32}$/iu.test(text)) {
+      return text.toLowerCase();
+    }
+    const offset = text.charAt(9).charCodeAt(0) - 'g'.charCodeAt(0);
+    if (offset < 0 || offset > 15) {
+      return /^[0-9a-z]{32}$/iu.test(text) ? text.toLowerCase() : '';
+    }
+    const replaced = text.toLowerCase().split('');
+    replaced[9] = offset.toString(16);
+    const decoded = [];
+    for (let index = 0; index < 32; index += 1) {
+      const ch = replaced[index];
+      if (!/^[a-f0-9]$/u.test(ch)) {
+        return text.toLowerCase();
+      }
+      decoded[index] = (parseInt(ch, 16) ^ (15 & index)).toString(16);
+    }
+    const original =
+      decoded.slice(8, 16).join('') +
+      decoded.slice(0, 8).join('') +
+      decoded.slice(24, 32).join('') +
+      decoded.slice(16, 24).join('');
+    return /^[a-f0-9]{32}$/u.test(original) ? original : text.toLowerCase();
+  }
+
+  function getBaiduBdstoken() {
+    try {
+      const params = new URLSearchParams(window.location.search || '');
+      const direct = params.get('bdstoken') || params.get('token') || '';
+      if (direct && direct.length > 10) {
+        return direct;
+      }
+    } catch {
+      /* ignore */
+    }
+
+    const page = getPageWindowObject();
+    const candidates = [
+      page?.yunData?.MYBDSTOKEN,
+      page?.yunData?.bdstoken,
+      page?.locals?.bdstoken,
+      page?.context?.bdstoken,
+      page?.config?.bdstoken,
+    ];
+    for (const value of candidates) {
+      const text = String(value || '').trim();
+      if (text.length > 10) {
+        return text;
+      }
+    }
+
+    try {
+      const stores = [page?.__redux_store__, page?.store, page?.reduxStore, page?.__NEXT_Redux_STORE__];
+      const findToken = (node, depth = 0, seen = new WeakSet()) => {
+        if (!node || typeof node !== 'object' || depth > 6 || seen.has(node)) {
+          return '';
+        }
+        seen.add(node);
+        for (const [key, value] of Object.entries(node)) {
+          if (/bdstoken/i.test(key) && typeof value === 'string' && value.length > 10) {
+            return value;
+          }
+          if (/^(token|access_token|authToken)$/i.test(key) && typeof value === 'string' && value.length > 20) {
+            return value;
+          }
+          const nested = findToken(value, depth + 1, seen);
+          if (nested) {
+            return nested;
+          }
+        }
+        return '';
+      };
+      for (const store of stores) {
+        if (store && typeof store.getState === 'function') {
+          const token = findToken(store.getState());
+          if (token) {
+            return String(token);
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    for (const script of Array.from(document.querySelectorAll('script'))) {
+      const source = script.textContent || '';
+      const matched = source.match(/["']bdstoken["']\s*[:=]\s*["']([^"']{10,100})["']/i)
+        || source.match(/bdstoken["'\s]*[:=]["'\s]*([a-f0-9]{20,100})/i);
+      if (matched?.[1]) {
+        return matched[1];
+      }
+    }
+    return '';
+  }
+
+  function getBaiduCurrentDir() {
+    const source = `${window.location.hash || ''}${window.location.search || ''}`;
+    const pathMatched = source.match(/[?&#]path=([^&#]+)/i);
+    if (pathMatched) {
+      return decodeUrlParam(pathMatched[1]).split('?')[0].split('#')[0] || '/';
+    }
+    const page = getPageWindowObject();
+    const candidates = [
+      page?.yunData?.path,
+      page?.yunData?.currentDir,
+      page?.yunData?.curPath,
+      page?.yunData?.request?.params?.path,
+    ];
+    for (const value of candidates) {
+      const text = String(value || '').trim();
+      if (text) {
+        return text.split('?')[0].split('#')[0] || '/';
+      }
+    }
+    return '/';
+  }
+
+  function extractBaiduSelectedFsIdsFromDom() {
+    const ids = new Set();
+    const selectedRows = document.querySelectorAll([
+      '.mouse-choose-item.selected',
+      '.wp-s-pan-table__body-row.selected',
+      '.ant-table-row-selected',
+      '[aria-selected="true"]',
+      '[class*="selected"][data-id]',
+      '[class*="selected"][data-fs-id]',
+      '[class*="selected"][data-fsid]',
+    ].join(', '));
+    const getIdFromFiber = (el) => {
+      const fiberKey = Object.keys(el || {}).find((key) => key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$'));
+      let fiber = fiberKey ? el[fiberKey] : null;
+      for (let index = 0; index < 30 && fiber; index += 1) {
+        const props = fiber.memoizedProps || fiber.pendingProps || {};
+        const item = props.item || props.file || props.fileInfo || props.data || props.fileItem || props.record || {};
+        const id = String(item.fs_id || item.fsId || item.id || props.fs_id || props.fsId || '').trim();
+        if (/^\d+$/u.test(id)) {
+          return id;
+        }
+        fiber = fiber.return;
+      }
+      return '';
+    };
+    selectedRows.forEach((row) => {
+      if (!row || row.tagName === 'INPUT' || row.tagName === 'BUTTON' || row.closest('thead')) {
+        return;
+      }
+      for (const attr of ['data-id', 'data-fs-id', 'data-fsid', 'data-key', 'data-row-key']) {
+        const id = String(row.getAttribute(attr) || '').trim();
+        if (/^\d+$/u.test(id)) {
+          ids.add(id);
+        }
+      }
+      const fiberId = getIdFromFiber(row);
+      if (fiberId) {
+        ids.add(fiberId);
+      }
+    });
+    return Array.from(ids);
+  }
+
+  function extractBaiduSelectedFsIdsFromState() {
+    const ids = new Set();
+    const page = getPageWindowObject();
+    try {
+      const stores = [page?.__redux_store__, page?.store, page?.reduxStore];
+      const visit = (node, depth = 0, seen = new WeakSet()) => {
+        if (!node || typeof node !== 'object' || depth > 7 || seen.has(node)) {
+          return;
+        }
+        seen.add(node);
+        if (Array.isArray(node)) {
+          return;
+        }
+        for (const [key, value] of Object.entries(node)) {
+          if (/^(selectedList|checkedList|selectedFiles|selectedFsIds|selectedRowKeys|selectedKeys|checkList)$/i.test(key) && Array.isArray(value)) {
+            value.slice(0, 2000).forEach((item) => {
+              const id = typeof item === 'object'
+                ? String(item?.fs_id || item?.fsId || item?.id || '').trim()
+                : String(item || '').trim();
+              if (/^\d+$/u.test(id)) {
+                ids.add(id);
+              }
+            });
+          } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+            visit(value, depth + 1, seen);
+          }
+        }
+      };
+      for (const store of stores) {
+        if (store && typeof store.getState === 'function') {
+          visit(store.getState());
+        }
+      }
+      const yunSelected = page?.yunData?.selectedFsIds;
+      if (Array.isArray(yunSelected)) {
+        yunSelected.forEach((id) => {
+          if (/^\d+$/u.test(String(id))) {
+            ids.add(String(id));
+          }
+        });
+      }
+    } catch {
+      /* ignore */
+    }
+    return Array.from(ids);
+  }
+
+  function cleanBaiduSelectedName(rawName) {
+    let value = String(rawName || '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+    if (!value || value.length > 500 || /^https?:\/\//iu.test(value)) {
+      return '';
+    }
+    if (/^(操作|下载|分享|更多|删除|重命名|移动|复制|收藏)$/u.test(value)) {
+      return '';
+    }
+    const half = Math.floor(value.length / 2);
+    if (half > 3 && value.slice(0, half).trim() === value.slice(half).trim()) {
+      value = value.slice(0, half).trim();
+    }
+    return value;
+  }
+
+  function extractBaiduSelectedFileNames() {
+    const names = new Set();
+    const rows = document.querySelectorAll([
+      '.mouse-choose-item.selected',
+      '.wp-s-pan-table__body-row.selected',
+      '.ant-table-row-selected',
+      '[aria-selected="true"]',
+      '[class*="selected"][class*="file"]',
+      '[class*="item-active"]',
+    ].join(', '));
+    rows.forEach((row) => {
+      if (!row || row.tagName === 'INPUT' || row.tagName === 'BUTTON' || row.closest('thead')) {
+        return;
+      }
+      const filenameSelectors = [
+        '.file-name',
+        '.filename',
+        '[class*="file-name"]',
+        '[class*="fileName"]',
+        '[class*="name-col"]',
+        'td[class*="name"]',
+        'a[title]',
+        'span[title]',
+      ];
+      for (const selector of filenameSelectors) {
+        const el = row.querySelector(selector);
+        const title = cleanBaiduSelectedName(el?.getAttribute?.('title'));
+        const text = cleanBaiduSelectedName(el?.textContent);
+        const name = title || text;
+        if (name) {
+          names.add(name);
+          return;
+        }
+      }
+      const ownTitle = cleanBaiduSelectedName(row.getAttribute('title'));
+      if (ownTitle) {
+        names.add(ownTitle);
+      }
+    });
+    return Array.from(names);
+  }
+
+  function getBaiduItemName(item) {
+    return chooseBestNameCandidate([
+      item?.server_filename,
+      item?.filename,
+      item?.fileName,
+      item?.name,
+    ]);
+  }
+
+  function isBaiduDirectoryItem(item) {
+    return Number(item?.isdir ?? item?.isDir ?? item?.dir) === 1;
+  }
+
+  async function fetchBaiduListPage({ dir = '/', page = 1, num = 1000, bdstoken = '' }) {
+    const url = new URL('https://pan.baidu.com/api/list');
+    const params = {
+      dir,
+      order: 'name',
+      desc: '0',
+      showempty: '0',
+      web: '1',
+      page,
+      num,
+      channel: 'chunlei',
+      app_id: '250528',
+      bdstoken,
+    };
+    Object.entries(params).forEach(([key, value]) => {
+      if (value != null && String(value) !== '') {
+        url.searchParams.set(key, String(value));
+      }
+    });
+    const response = await requestMiaochuanJson(url.toString(), {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json, text/plain, */*',
+        Referer: 'https://pan.baidu.com/disk/main',
+      },
+      timeout: 45000,
+    });
+    const payload = response.payload;
+    const errno = Number(payload?.errno ?? 0);
+    if (!response.ok || errno !== 0 || !Array.isArray(payload?.list)) {
+      if (errno === -7) {
+        throw new Error('百度 bdstoken 已过期或无效，请刷新百度网盘页面并重新登录后再试。');
+      }
+      throw new Error(`百度网盘目录读取失败：${getErrorText(payload || response.text || `HTTP ${response.status}`)}`);
+    }
+    captureMiaochuanSourcePayload(`baidu-list:${dir}:${page}`, { dir, page }, payload);
+    return payload;
+  }
+
+  async function fetchBaiduFileMetas(fsIds, bdstoken) {
+    const map = new Map();
+    const ids = Array.from(new Set((fsIds || []).map((id) => String(id || '').trim()).filter((id) => /^\d+$/u.test(id))));
+    for (let offset = 0; offset < ids.length; offset += 100) {
+      const batch = ids.slice(offset, offset + 100);
+      const url = new URL('https://pan.baidu.com/api/filemetas');
+      url.searchParams.set('fsids', JSON.stringify(batch.map(Number)));
+      url.searchParams.set('dlink', '0');
+      url.searchParams.set('thumb', '0');
+      url.searchParams.set('extra', '0');
+      url.searchParams.set('needmedia', '0');
+      url.searchParams.set('detail', '1');
+      url.searchParams.set('channel', 'chunlei');
+      url.searchParams.set('web', '1');
+      url.searchParams.set('app_id', '250528');
+      url.searchParams.set('bdstoken', bdstoken);
+      const response = await requestMiaochuanJson(url.toString(), {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json, text/plain, */*',
+          Referer: 'https://pan.baidu.com/disk/main',
+        },
+        timeout: 45000,
+      });
+      const payload = response.payload;
+      const errno = Number(payload?.errno ?? 0);
+      if (!response.ok || errno !== 0 || !Array.isArray(payload?.info)) {
+        if (errno === -7) {
+          throw new Error('百度 bdstoken 已过期或无效，请刷新百度网盘页面并重新登录后再试。');
+        }
+        throw new Error(`百度网盘文件信息读取失败：${getErrorText(payload || response.text || `HTTP ${response.status}`)}`);
+      }
+      payload.info.forEach((item) => {
+        map.set(String(item.fs_id || ''), item);
+      });
+      await sleep(120);
+    }
+    return map;
+  }
+
+  async function collectBaiduDirectoryFiles(baiduPath, pathPrefix, bdstoken, options = {}) {
+    const rows = [];
+    let page = 1;
+    const pageSize = 100;
+    while (page <= 500) {
+      await waitForTaskControl(options.taskControl || null);
+      if (typeof options.onProgress === 'function') {
+        options.onProgress({
+          visible: true,
+          percent: 0,
+          indeterminate: true,
+          text: `正在读取百度目录：${pathPrefix || baiduPath || '/'} | 已收集 ${rows.length} 个文件`,
+        });
+      }
+      const payload = await fetchBaiduListPage({ dir: baiduPath || '/', page, num: pageSize, bdstoken });
+      const list = Array.isArray(payload.list) ? payload.list : [];
+      for (const item of list) {
+        const name = sanitizeCloudDirName(getBaiduItemName(item), '未命名');
+        const itemPath = `${pathPrefix || ''}/${name}`.replace(/\/{2,}/g, '/');
+        if (isBaiduDirectoryItem(item)) {
+          rows.push(...(await collectBaiduDirectoryFiles(String(item.path || ''), itemPath, bdstoken, options)));
+        } else {
+          const etag = decodeBaiduMd5(item.md5 || item.file_md5 || item.etag || '');
+          rows.push({
+            path: itemPath,
+            etag,
+            size: String(normalizeMiaochuanInteger(item.size) || 0),
+            __gypSource: 'baidu-active',
+            __gypProvider: 'baidu',
+            __gypFsId: String(item.fs_id || ''),
+            __gypHasMd5: Boolean(normalizeMiaochuanMd5(etag)),
+          });
+        }
+        if (rows.length > SHARE_LINK_MAX_FILES) {
+          throw new Error(`百度网盘文件过多，已超过安全上限 ${SHARE_LINK_MAX_FILES} 个文件。请进入更小的子目录后再生成。`);
+        }
+      }
+      if (!list.length || list.length < pageSize) {
+        break;
+      }
+      page += 1;
+      await sleep(150);
+    }
+    return rows;
+  }
+
+  async function collectBaiduSelectedRows(options = {}) {
+    if (!isBaiduPageHost()) {
+      throw new Error('当前页面不是百度网盘。');
+    }
+    if (isBaiduSharePage()) {
+      throw new Error('百度分享页暂时不能直接生成光鸭秒传 JSON，因为分享页通常不返回真实 MD5。请先把文件保存到自己的百度网盘，再到“我的网盘/文件列表”里勾选后使用“网盘互通（百度）”。');
+    }
+    const bdstoken = getBaiduBdstoken();
+    if (!bdstoken) {
+      throw new Error('没有获取到百度 bdstoken。请刷新百度网盘页面，等待列表加载完成后再试。');
+    }
+    const selectedIds = Array.from(new Set([
+      ...extractBaiduSelectedFsIdsFromDom(),
+      ...extractBaiduSelectedFsIdsFromState(),
+    ]));
+    const rows = [];
+    const folders = [];
+    if (selectedIds.length) {
+      if (typeof options.onProgress === 'function') {
+        options.onProgress({ visible: true, percent: 0, indeterminate: true, text: `正在读取百度勾选项信息：${selectedIds.length} 项` });
+      }
+      const metas = await fetchBaiduFileMetas(selectedIds, bdstoken);
+      for (const id of selectedIds) {
+        const item = metas.get(String(id));
+        if (!item) {
+          continue;
+        }
+        const name = sanitizeCloudDirName(getBaiduItemName(item), '未命名');
+        if (isBaiduDirectoryItem(item)) {
+          folders.push({ baiduPath: String(item.path || ''), pathPrefix: name });
+        } else {
+          const etag = decodeBaiduMd5(item.md5 || item.file_md5 || item.etag || '');
+          rows.push({
+            path: name,
+            etag,
+            size: String(normalizeMiaochuanInteger(item.size) || 0),
+            __gypSource: 'baidu-active',
+            __gypProvider: 'baidu',
+            __gypFsId: String(item.fs_id || id),
+            __gypHasMd5: Boolean(normalizeMiaochuanMd5(etag)),
+          });
+        }
+      }
+    }
+
+    if (!rows.length && !folders.length) {
+      const names = extractBaiduSelectedFileNames();
+      if (!names.length) {
+        throw new Error('请先在百度网盘勾选要生成的文件或文件夹。');
+      }
+      const currentDir = getBaiduCurrentDir();
+      const payload = await fetchBaiduListPage({ dir: currentDir, page: 1, num: 1000, bdstoken });
+      const fuzzyMatch = (serverName, selectedName) => {
+        const normalize = (text) => String(text || '').replace(/[\s\r\n]+/g, ' ').trim();
+        const left = normalize(serverName);
+        const right = normalize(selectedName);
+        if (left === right) {
+          return true;
+        }
+        const half = Math.floor(right.length / 2);
+        return half > 3 && left === right.slice(0, half).trim();
+      };
+      for (const item of payload.list || []) {
+        const name = getBaiduItemName(item);
+        if (!names.some((selectedName) => fuzzyMatch(name, selectedName))) {
+          continue;
+        }
+        const safeName = sanitizeCloudDirName(name, '未命名');
+        if (isBaiduDirectoryItem(item)) {
+          folders.push({ baiduPath: String(item.path || ''), pathPrefix: safeName });
+        } else {
+          const etag = decodeBaiduMd5(item.md5 || item.file_md5 || item.etag || '');
+          rows.push({
+            path: safeName,
+            etag,
+            size: String(normalizeMiaochuanInteger(item.size) || 0),
+            __gypSource: 'baidu-active',
+            __gypProvider: 'baidu',
+            __gypFsId: String(item.fs_id || ''),
+            __gypHasMd5: Boolean(normalizeMiaochuanMd5(etag)),
+          });
+        }
+      }
+    }
+
+    for (const folder of folders) {
+      rows.push(...(await collectBaiduDirectoryFiles(folder.baiduPath, folder.pathPrefix, bdstoken, options)));
+    }
+    if (!rows.length) {
+      throw new Error('没有找到可生成的百度网盘文件。');
+    }
+    return setMiaochuanCapturedRowsFromProvider(rows, 'baidu-active');
+  }
+
+  function isXunleiPageHost() {
+    return /^pan\.xunlei\.com$/i.test(window.location.hostname || '');
+  }
+
+  function isXunleiSharePage() {
+    return isXunleiPageHost() && /^\/s\//i.test(window.location.pathname || '');
+  }
+
+  function getXunleiCachedAuth() {
+    const headers = sanitizeHeaders(STATE.lastXunleiHeaders || {});
+    return {
+      token: String(headers.authorization || '').replace(/^Bearer\s+/i, '').trim(),
+      deviceId: String(headers['x-device-id'] || '').trim(),
+      captchaToken: String(headers['x-captcha-token'] || '').trim(),
+      clientId: String(headers['x-client-id'] || XUNLEI_CLIENT_ID).trim() || XUNLEI_CLIENT_ID,
+    };
+  }
+
+  function getXunleiRequestHeaders() {
+    const auth = getXunleiCachedAuth();
+    const headers = {
+      Accept: 'application/json, text/plain, */*',
+      'Content-Type': 'application/json',
+      Referer: 'https://pan.xunlei.com/',
+      'x-client-id': auth.clientId || XUNLEI_CLIENT_ID,
+    };
+    if (auth.token) {
+      headers.Authorization = `Bearer ${auth.token}`;
+    }
+    if (auth.deviceId) {
+      headers['x-device-id'] = auth.deviceId;
+    }
+    if (auth.captchaToken) {
+      headers['x-captcha-token'] = auth.captchaToken;
+    }
+    return headers;
+  }
+
+  function assertXunleiAuthReady() {
+    if (!getXunleiCachedAuth().token) {
+      throw new Error('没有捕获到迅雷登录态。请在已登录的迅雷云盘页面刷新一次，等待文件列表加载完成或点击一次文件列表后再试。');
+    }
+  }
+
+  function getXunleiStore() {
+    const page = getPageWindowObject();
+    const vueRoots = [
+      document.querySelector("[class*='SourceListItem__item']"),
+      document.querySelector("[class*='Share__']"),
+      document.querySelector('#app'),
+      document.querySelector('#root'),
+      document.body,
+    ].filter(Boolean);
+    for (const el of vueRoots) {
+      const store = el?.__vue__?.$store || el?.__vue__?.$root?.$store;
+      if (store) {
+        return store;
+      }
+    }
+    return page?.$store || null;
+  }
+
+  function getXunleiSelectedIds() {
+    const ids = new Set();
+    if (isXunleiSharePage()) {
+      const store = getXunleiStore();
+      const share = store?.state?.share || {};
+      for (const key of ['checkedFileIds', 'selectedFileIds', 'selectedIds', 'checkedIds', 'selected']) {
+        const value = share[key];
+        if (Array.isArray(value)) {
+          value.forEach((id) => ids.add(String(id)));
+        }
+      }
+      const listIds = Array.isArray(share.list) ? share.list : [];
+      if (!ids.size && listIds.length) {
+        const checks = Array.from(document.querySelectorAll("input[type='checkbox']"))
+          .filter((cb) => !cb.closest("thead, th, [class*='header' i], [class*='Header']") && cb.getAttribute('aria-label') !== 'Select all');
+        checks.forEach((cb, index) => {
+          if (cb.checked && listIds[index]) {
+            ids.add(String(listIds[index]));
+          }
+        });
+      }
+    } else {
+      const items = document.querySelectorAll("[class*='SourceListItem__item']");
+      for (const el of items) {
+        const selected = el?.__vue__?.$props?.selected;
+        if (Array.isArray(selected)) {
+          selected.forEach((id) => ids.add(String(id)));
+        }
+      }
+    }
+    document.querySelectorAll("input[type='checkbox']:checked").forEach((cb) => {
+      if (cb.closest("thead, th, [class*='header' i]")) {
+        return;
+      }
+      let el = cb.parentElement;
+      for (let depth = 0; depth < 15 && el; depth += 1) {
+        const fileId = el.__vue__?.$props?.file?.id || el.__vue__?.$props?.id || el.__vue__?.$data?.file?.id || el.__vue__?.$data?.id || el.dataset?.id || el.dataset?.fileId || el.getAttribute('data-id');
+        if (fileId) {
+          ids.add(String(fileId));
+          break;
+        }
+        el = el.parentElement;
+      }
+    });
+    return Array.from(ids).filter(Boolean);
+  }
+
+  function getXunleiFileById(id) {
+    const store = getXunleiStore();
+    const state = store?.state || {};
+    const maps = [
+      state.drive?.all,
+      state.share?.files,
+      state.share?.fileMap,
+    ];
+    for (const map of maps) {
+      if (map && typeof map === 'object' && !Array.isArray(map) && map[id]) {
+        return map[id];
+      }
+    }
+    const arrays = [state.share?.fileList, state.drive?.fileList, state.drive?.list].filter(Array.isArray);
+    for (const arr of arrays) {
+      const found = arr.find((item) => String(item?.id || '') === String(id));
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  function normalizeXunleiFileRow(file, pathPrefix = '') {
+    const name = sanitizeCloudDirName(file?.name || file?.file_name || file?.filename || '未命名', '未命名');
+    const gcid = String(file?.hash || file?.gcid || '').trim().toUpperCase();
+    return {
+      path: `${pathPrefix || ''}/${name}`.replace(/\/{2,}/g, '/'),
+      gcid,
+      size: String(normalizeMiaochuanInteger(file?.size) || 0),
+      __gypSource: isXunleiSharePage() ? 'xunlei-share-active' : 'xunlei-active',
+      __gypProvider: 'xunlei',
+      __gypFileId: String(file?.id || ''),
+      __gypHasGcid: Boolean(/^[a-f0-9]{40}$/iu.test(gcid)),
+    };
+  }
+
+  async function fetchXunleiFolderRows(parentId, pathPrefix = '', options = {}) {
+    assertXunleiAuthReady();
+    const rows = [];
+    let pageToken = '';
+    do {
+      await waitForTaskControl(options.taskControl || null);
+      if (typeof options.onProgress === 'function') {
+        options.onProgress({
+          visible: true,
+          percent: 0,
+          indeterminate: true,
+              text: `正在读取迅雷目录：${String(pathPrefix || '/').replace(/^\/+/, '') || '/'} | 已收集 ${rows.length} 个文件`,
+        });
+      }
+      const filters = encodeURIComponent(JSON.stringify({
+        phase: { eq: 'PHASE_TYPE_COMPLETE' },
+        trashed: { eq: false },
+      }));
+      const url = `${XUNLEI_API_BASE}/drive/v1/files?parent_id=${encodeURIComponent(parentId || '')}&usage=DISPLAY&filters=${filters}&with_audit=true&thumbnail_size=SIZE_SMALL&limit=100&page_token=${encodeURIComponent(pageToken)}`;
+      const response = await requestMiaochuanJson(url, {
+        method: 'GET',
+        headers: getXunleiRequestHeaders(),
+        timeout: 45000,
+      });
+      if (!response.ok) {
+        throw new Error(`迅雷目录读取失败：${getErrorText(response.payload || response.text || `HTTP ${response.status}`)}`);
+      }
+      const files = Array.isArray(response.payload?.files) ? response.payload.files : [];
+      captureMiaochuanSourcePayload(`xunlei-folder:${parentId}:${pageToken || 'first'}`, { parentId, pageToken }, response.payload);
+      for (const file of files) {
+        if (file?.kind === 'drive#folder') {
+          rows.push(...(await fetchXunleiFolderRows(file.id, `${String(pathPrefix || '').replace(/^\/+/, '')}/${sanitizeCloudDirName(file.name, '未命名')}`.replace(/\/{2,}/g, '/').replace(/^\/+/, ''), options)));
+        } else {
+          const row = normalizeXunleiFileRow(file, pathPrefix);
+          if (row.gcid) {
+            rows.push(row);
+          }
+        }
+      }
+      pageToken = String(response.payload?.next_page_token || '');
+      if (rows.length > SHARE_LINK_MAX_FILES) {
+        throw new Error(`迅雷云盘文件过多，已超过安全上限 ${SHARE_LINK_MAX_FILES} 个文件。请进入更小的子目录后再生成。`);
+      }
+    } while (pageToken);
+    return rows;
+  }
+
+  function getXunleiShareId() {
+    const matched = String(window.location.pathname || '').match(/^\/s\/([^/?#]+)/i);
+    return matched ? decodeUrlParam(matched[1]) : '';
+  }
+
+  function getCurrentXunleiShareIdFromStore() {
+    const store = getXunleiStore();
+    const info = store?.state?.share?.shareInfo || {};
+    return String(info.shareId || info.share_id || info.id || getXunleiShareId() || '').trim();
+  }
+
+  function getXunleiPassCodeToken() {
+    const store = getXunleiStore();
+    return String(store?.state?.share?.shareInfo?.passCodeToken || '').trim();
+  }
+
+  async function fetchXunleiShareRootFiles(shareId, passCodeToken) {
+    const url = `${XUNLEI_API_BASE}/drive/v1/share/detail?share_id=${encodeURIComponent(shareId)}&parent_id=&pass_code_token=${encodeURIComponent(passCodeToken)}&limit=100&thumbnail_size=SIZE_SMALL`;
+    const response = await requestMiaochuanJson(url, {
+      method: 'GET',
+      headers: getXunleiRequestHeaders(),
+      timeout: 45000,
+    });
+    if (!response.ok) {
+      throw new Error(`迅雷分享根目录读取失败：${getErrorText(response.payload || response.text || `HTTP ${response.status}`)}`);
+    }
+    return Array.isArray(response.payload?.files) ? response.payload.files : [];
+  }
+
+  async function fetchXunleiShareFolderRows(shareId, parentId, passCodeToken, pathPrefix = '', options = {}) {
+    assertXunleiAuthReady();
+    const rows = [];
+    let pageToken = '';
+    do {
+      await waitForTaskControl(options.taskControl || null);
+      if (typeof options.onProgress === 'function') {
+        options.onProgress({
+          visible: true,
+          percent: 0,
+          indeterminate: true,
+              text: `正在读取迅雷分享目录：${String(pathPrefix || '/').replace(/^\/+/, '') || '/'} | 已收集 ${rows.length} 个文件`,
+        });
+      }
+      const url = `${XUNLEI_API_BASE}/drive/v1/share/detail?share_id=${encodeURIComponent(shareId)}&parent_id=${encodeURIComponent(parentId || '')}&pass_code_token=${encodeURIComponent(passCodeToken)}&limit=100&page_token=${encodeURIComponent(pageToken)}&thumbnail_size=SIZE_SMALL`;
+      const response = await requestMiaochuanJson(url, {
+        method: 'GET',
+        headers: getXunleiRequestHeaders(),
+        timeout: 45000,
+      });
+      if (!response.ok) {
+        throw new Error(`迅雷分享目录读取失败：${getErrorText(response.payload || response.text || `HTTP ${response.status}`)}`);
+      }
+      const files = Array.isArray(response.payload?.files) ? response.payload.files : [];
+      captureMiaochuanSourcePayload(`xunlei-share:${shareId}:${parentId}:${pageToken || 'first'}`, { parentId, pageToken }, response.payload);
+      for (const file of files) {
+        if (file?.kind === 'drive#folder') {
+          rows.push(...(await fetchXunleiShareFolderRows(shareId, file.id, passCodeToken, `${String(pathPrefix || '').replace(/^\/+/, '')}/${sanitizeCloudDirName(file.name, '未命名')}`.replace(/\/{2,}/g, '/').replace(/^\/+/, ''), options)));
+        } else {
+          const row = normalizeXunleiFileRow(file, pathPrefix);
+          if (row.gcid) {
+            rows.push(row);
+          }
+        }
+      }
+      pageToken = String(response.payload?.next_page_token || '');
+      if (rows.length > SHARE_LINK_MAX_FILES) {
+        throw new Error(`迅雷分享文件过多，已超过安全上限 ${SHARE_LINK_MAX_FILES} 个文件。请进入更小的子目录后再生成。`);
+      }
+    } while (pageToken);
+    return rows;
+  }
+
+  async function fetchXunleiShareRowsFromShareInfo(shareInfo = {}, options = {}) {
+    const shareId = String(shareInfo.shareId || '').trim();
+    if (!shareId) {
+      throw new Error('没有拿到迅雷分享 ID。');
+    }
+    assertXunleiAuthReady();
+    const currentShareId = getCurrentXunleiShareIdFromStore();
+    const passCodeToken = getXunleiPassCodeToken();
+    if (!passCodeToken || (currentShareId && currentShareId !== shareId && getXunleiShareId() !== shareId)) {
+      throw new Error('迅雷分享直读需要先打开并加载这个迅雷分享页一次，再回到面板点“读取链接目录”。');
+    }
+    const rootFiles = await fetchXunleiShareRootFiles(shareId, passCodeToken);
+    const rows = [];
+    for (const file of rootFiles) {
+      await waitForTaskControl(options.taskControl || null);
+      if (file?.kind === 'drive#folder') {
+        rows.push(...(await fetchXunleiShareFolderRows(shareId, file.id, passCodeToken, sanitizeCloudDirName(file.name, '未命名'), options)));
+      } else {
+        const row = normalizeXunleiFileRow(file);
+        if (row.gcid) {
+          rows.push(row);
+        }
+      }
+      if (rows.length > SHARE_LINK_MAX_FILES) {
+        throw new Error(`迅雷分享文件过多，已超过安全上限 ${SHARE_LINK_MAX_FILES} 个文件。请进入更小的子目录后再生成。`);
+      }
+    }
+    if (!rows.length) {
+      throw new Error('迅雷分享里没有可生成的文件（文件夹为空或文件没有 GCID）。');
+    }
+    setMiaochuanCapturedRowsFromProvider(rows, `xunlei-share:${shareId}`);
+    return rows;
+  }
+
+  async function collectXunleiSelectedRows(options = {}) {
+    if (!isXunleiPageHost()) {
+      throw new Error('当前页面不是迅雷云盘。');
+    }
+    assertXunleiAuthReady();
+    const selectedIds = getXunleiSelectedIds();
+    if (!selectedIds.length) {
+      throw new Error('请先在迅雷云盘勾选要生成的文件或文件夹。');
+    }
+    const rows = [];
+    if (isXunleiSharePage()) {
+      const shareId = getXunleiShareId();
+      const passCodeToken = getXunleiPassCodeToken();
+      if (!shareId || !passCodeToken) {
+        throw new Error('没有拿到迅雷分享 ID 或 pass_code_token，请等待分享页加载完成后重试。');
+      }
+      let rootFiles = null;
+      for (const id of selectedIds) {
+        let file = getXunleiFileById(id);
+        if (!file) {
+          rootFiles = rootFiles || await fetchXunleiShareRootFiles(shareId, passCodeToken);
+          file = rootFiles.find((item) => String(item?.id || '') === String(id));
+        }
+        if (!file) {
+          continue;
+        }
+        if (file.kind === 'drive#folder') {
+          rows.push(...(await fetchXunleiShareFolderRows(shareId, file.id, passCodeToken, sanitizeCloudDirName(file.name, '未命名'), options)));
+        } else {
+          const row = normalizeXunleiFileRow(file);
+          if (row.gcid) {
+            rows.push(row);
+          }
+        }
+      }
+    } else {
+      for (const id of selectedIds) {
+        const file = getXunleiFileById(id);
+        if (!file) {
+          continue;
+        }
+        if (file.kind === 'drive#folder') {
+          rows.push(...(await fetchXunleiFolderRows(file.id, sanitizeCloudDirName(file.name, '未命名'), options)));
+        } else {
+          const row = normalizeXunleiFileRow(file);
+          if (row.gcid) {
+            rows.push(row);
+          }
+        }
+      }
+    }
+    if (!rows.length) {
+      throw new Error('所选迅雷项目中没有可生成的文件（文件夹为空或文件没有 GCID）。');
+    }
+    return setMiaochuanCapturedRowsFromProvider(rows, isXunleiSharePage() ? 'xunlei-share-active' : 'xunlei-active');
   }
 
   function quarkApiUrl(path, params = {}) {
@@ -4177,16 +5131,7 @@
   }
 
   function setMiaochuanCapturedRowsFromShareRows(rows, sourceKey) {
-    const list = Array.isArray(rows) ? rows : [];
-    STATE.miaochuanCapturedRows = list;
-    STATE.miaochuanCapturedMap = {};
-    list.forEach((row) => {
-      STATE.miaochuanCapturedMap[getMiaochuanCandidateKey(row)] = row;
-    });
-    STATE.lastMiaochuanCaptureAt = Date.now();
-    STATE.lastMiaochuanCaptureUrl = sourceKey || 'share-link';
-    renderMiaochuanCaptureStatus();
-    return list;
+    return setMiaochuanCapturedRowsFromProvider(rows, sourceKey || 'share-link');
   }
 
   function get123PanRequestHeaders(shareKey = '', options = {}) {
@@ -4990,10 +5935,22 @@
         notes.push('来源由夸克分享链接直读生成；工具已递归读取目录并尽量补齐真实 MD5。');
       }
     }
+    if (/xunlei|迅雷/u.test(topSource)) {
+      labels.push('迅雷云盘');
+      notes.push('来源包含迅雷 GCID；直接导入光鸭时会走 GCID 秒传检测，不按 32 位 MD5 处理。');
+    }
+    if (/baidu|百度/u.test(topSource)) {
+      labels.push('百度网盘');
+      notes.push('来源由百度网盘当前勾选生成；工具会尝试解出百度返回的 MD5 并转换成光鸭 etag。');
+    }
 
     if (has('etag') && has('files')) {
       labels.push('光鸭/通用秒传 JSON');
       notes.push('检测到 files + etag 结构，通常可直接转换；是否成功取决于 etag 是否为真实完整 MD5，以及光鸭库存是否命中。');
+    }
+    if (has('gcid') && has('files')) {
+      labels.push('迅雷云盘');
+      notes.push('检测到 files + gcid 结构，直接导入光鸭时会使用 GCID 秒传路径。');
     }
     if (has('fid', 'pdir_fid', 'file_name', 'obj_category')) {
       labels.push('夸克网盘');
@@ -5013,7 +5970,10 @@
     }
 
     const rows = Array.isArray(rawFiles) ? rawFiles : [];
-    const validHashRows = rows.filter((raw) => pickMiaochuanHashValue(raw).supported && isExactMiaochuanMd5(pickMiaochuanHashValue(raw).value));
+    const validHashRows = rows.filter((raw) => {
+      const hash = pickMiaochuanHashValue(raw);
+      return hash.supported && (hash.hashKind === 'gcid' || isExactMiaochuanMd5(hash.value));
+    });
     const unsupportedHashRows = rows.filter((raw) => {
       const hash = pickMiaochuanHashValue(raw);
       return hash.key && !hash.supported;
@@ -5239,15 +6199,18 @@
       const pathValue = normalizeMiaochuanPath(pathPick.value, options);
       const rawPathText = String(pathPick.value == null ? '' : pathPick.value);
       const label = `第 ${index + 1} 项`;
+      const gcidValue = hashPick.hashKind === 'gcid' && /^[a-f0-9]{40}$/iu.test(String(hashPick.value || '').trim())
+        ? String(hashPick.value || '').trim().toUpperCase()
+        : '';
 
-      if (!etag) {
+      if (!etag && !gcidValue) {
         const pathHint = pathValue || normalizeMiaochuanPath(pathPick.value, { ...options, decodeHtml: true, stripLeadingSlash: false }) || String(raw.path || raw.name || raw.server_filename || '').trim();
         if (hashPick.key) {
-          errors.push(`${label} 缺少可用于光鸭 etag 的 32 位 MD5。文件：${pathHint || '（路径未识别）'}；字段 ${hashPick.key} 原值：${JSON.stringify(hashPick.value ?? '')}`);
+          errors.push(`${label} 缺少可用于光鸭 etag 的 32 位 MD5 或迅雷 GCID。文件：${pathHint || '（路径未识别）'}；字段 ${hashPick.key} 原值：${JSON.stringify(hashPick.value ?? '')}`);
         } else {
-          errors.push(`${label} 缺少可用于光鸭 etag 的 32 位 MD5。文件：${pathHint || '（路径未识别）'}。${hashPick.reason || ''}`);
+          errors.push(`${label} 缺少可用于光鸭 etag 的 32 位 MD5 或迅雷 GCID。文件：${pathHint || '（路径未识别）'}。${hashPick.reason || ''}`);
         }
-      } else if (!isExactMiaochuanMd5(hashPick.value)) {
+      } else if (!gcidValue && !isExactMiaochuanMd5(hashPick.value)) {
         warnings.push(`${label} ${hashPick.key} 已提取为 ${etag}，但原始值不是纯 32 位 MD5：${JSON.stringify(hashPick.value ?? '')}`);
       }
       if (size == null) {
@@ -5273,14 +6236,19 @@
         }
       }
 
-      if (!etag || size == null || !pathValue) {
+      if ((!etag && !gcidValue) || size == null || !pathValue) {
         return;
       }
-      normalizedFiles.push({
-        etag,
+      const normalizedFile = {
         size: options.sizeAsNumber ? size : String(size),
         path: pathValue,
-      });
+      };
+      if (gcidValue) {
+        normalizedFile.gcid = gcidValue;
+      } else {
+        normalizedFile.etag = etag;
+      }
+      normalizedFiles.push(normalizedFile);
     });
 
     if (options.sortByPath !== false) {
@@ -5289,7 +6257,7 @@
 
     const duplicateMap = new Map();
     normalizedFiles.forEach((item) => {
-      const key = `${item.etag}__${String(item.size)}__${item.path}`;
+      const key = `${item.etag || item.gcid || ''}__${String(item.size)}__${item.path}`;
       duplicateMap.set(key, (duplicateMap.get(key) || 0) + 1);
     });
     duplicateMap.forEach((count, key) => {
@@ -5352,7 +6320,7 @@
   }
 
   function getShareLinkRowKey(row) {
-    return [row?.path || '', row?.etag || '', row?.size || ''].join('__');
+    return [row?.path || '', row?.etag || row?.gcid || '', row?.size || ''].join('__');
   }
 
   function getSelectedShareLinkRows() {
@@ -5368,12 +6336,12 @@
     const rows = Array.isArray(STATE.shareLinkRows) ? STATE.shareLinkRows : [];
     const meta = STATE.shareLinkMeta || {};
     const selectedRows = getSelectedShareLinkRows();
-    const readyCount = rows.filter((row) => Boolean(normalizeMiaochuanMd5(row?.etag || ''))).length;
+    const readyCount = rows.filter((row) => Boolean(normalizeMiaochuanMd5(row?.etag || '') || /^[a-f0-9]{40}$/iu.test(String(row?.gcid || '').trim()))).length;
     const totalSize = rows.reduce((sum, row) => sum + Number(normalizeMiaochuanInteger(row?.size) || 0), 0);
 
     UI.shareLinkCount.textContent = `已选 ${selectedRows.length}/${rows.length}`;
     UI.shareLinkSummary.textContent = rows.length
-      ? `${meta.label || '分享链接'} | 文件 ${rows.length} 项 | 已就绪 MD5 ${readyCount} 项 | 总大小 ${formatMiaochuanBytes(totalSize)}`
+      ? `${meta.label || '分享链接'} | 文件 ${rows.length} 项 | 已就绪 MD5/GCID ${readyCount} 项 | 总大小 ${formatMiaochuanBytes(totalSize)}`
       : (meta.message || '粘贴分享链接后，先点“读取链接目录”，这里会显示可勾选的文件清单。');
 
     if (!rows.length) {
@@ -5387,16 +6355,31 @@
       const path = String(row?.path || '');
       const sizeText = formatMiaochuanBytes(normalizeMiaochuanInteger(row?.size) || 0);
       const md5 = normalizeMiaochuanMd5(row?.etag || '');
+      const gcid = /^[a-f0-9]{40}$/iu.test(String(row?.gcid || '').trim()) ? String(row.gcid).trim().toUpperCase() : '';
+      const hashText = md5 ? `MD5: ${escapeHtml(md5)}` : (gcid ? `GCID: ${escapeHtml(gcid)}` : 'MD5/GCID 未拿到，导入时会被跳过');
       return `
         <label class="gyp-empty-dir-row">
           <input type="checkbox" data-action="toggle-share-link-file" data-share-link-key="${escapeHtml(key)}" ${checked ? 'checked' : ''} />
           <div class="gyp-empty-dir-main">
             <div class="gyp-empty-dir-path" title="${escapeHtml(path)}">${escapeHtml(path)}</div>
-            <div class="gyp-empty-dir-meta">${escapeHtml(sizeText)} | ${md5 ? `MD5: ${escapeHtml(md5)}` : 'MD5 未拿到，导入时会被跳过'}</div>
+            <div class="gyp-empty-dir-meta">${escapeHtml(sizeText)} | ${hashText}</div>
           </div>
         </label>
       `;
     }).join('');
+  }
+
+  function setMiaochuanCapturedRowsFromProvider(rows, sourceKey) {
+    const list = Array.isArray(rows) ? rows.filter((row) => row && typeof row === 'object') : [];
+    STATE.miaochuanCapturedRows = list;
+    STATE.miaochuanCapturedMap = {};
+    list.forEach((row) => {
+      STATE.miaochuanCapturedMap[getMiaochuanCandidateKey(row)] = row;
+    });
+    STATE.lastMiaochuanCaptureAt = Date.now();
+    STATE.lastMiaochuanCaptureUrl = sourceKey || 'provider-active';
+    renderMiaochuanCaptureStatus();
+    return list;
   }
 
   function setShareLinkRows(rows = [], meta = {}) {
@@ -5464,6 +6447,16 @@
     if (detected.provider === 'tianyiyun') {
       const rows = await fetchTianyiShareRowsFromShareInfo({
         shareCode: detected.shareCode,
+        passcode: detected.passcode,
+      }, options);
+      setShareLinkRows(rows, detected);
+      updatePanelStatus(`已读取 ${detected.label}：文件 ${rows.length} 项`);
+      return rows;
+    }
+
+    if (detected.provider === 'xunlei') {
+      const rows = await fetchXunleiShareRowsFromShareInfo({
+        shareId: detected.shareId,
         passcode: detected.passcode,
       }, options);
       setShareLinkRows(rows, detected);
@@ -5576,10 +6569,30 @@
 
   async function generateMiaochuanJsonFromCapturedPage(options = {}) {
     let rows = Array.isArray(STATE.miaochuanCapturedRows) ? STATE.miaochuanCapturedRows : [];
+    if (isBaiduSharePage()) {
+      throw new Error('百度分享页暂时不能直接生成光鸭秒传 JSON。请先点百度页面里的“保存到网盘”，再进入自己的百度网盘目录勾选文件后生成。');
+    }
+    if (isBaiduPageHost()) {
+      updatePanelStatus('正在读取百度网盘勾选项并生成 MD5 秒传数据...');
+      rows = await collectBaiduSelectedRows(options);
+    } else if (isXunleiPageHost()) {
+      updatePanelStatus('正在读取迅雷云盘勾选项并生成 GCID 秒传数据...');
+      rows = await collectXunleiSelectedRows(options);
+    }
     const quarkSharePwdId = isQuarkPageHost() ? getQuarkSharePwdIdFromLocation() : '';
-    if (quarkSharePwdId) {
+    if (!rows.length && quarkSharePwdId) {
       updatePanelStatus('正在主动读取夸克分享页文件列表并获取真实 MD5...');
       rows = await fetchQuarkShareRowsFromCurrentPage({
+        onProgress: options.onProgress,
+      });
+    }
+    const pan123ShareKey = is123PanPageHost() ? get123PanShareKeyFromLocation() : '';
+    if (!rows.length && pan123ShareKey) {
+      updatePanelStatus('正在主动读取 123 网盘分享页文件列表...');
+      rows = await fetch123PanShareRowsFromShareInfo({
+        shareKey: pan123ShareKey,
+        passcode: get123PanSharePasscodeFromLocation(),
+      }, {
         onProgress: options.onProgress,
       });
     }
@@ -5711,6 +6724,10 @@
     return `${CONFIG.request.apiHost}/nd.bizuserres.s/v1/get_res_center_token`;
   }
 
+  function getGuangyaCheckFlashUploadUrl() {
+    return `${CONFIG.request.apiHost}/nd.bizuserres.s/v1/check_can_flash_upload`;
+  }
+
   function getGuangyaDeleteUploadTaskUrl() {
     return `${CONFIG.request.apiHost}/nd.bizuserres.s/v1/file/delete_upload_task`;
   }
@@ -5820,17 +6837,29 @@
   }
 
   async function getMiaochuanNormalizedForDirectImport(options = {}) {
-    if (options.normalized && Array.isArray(options.normalized.files)) {
+    const hasDirectImportFiles = (payload) => Boolean(payload && Array.isArray(payload.files) && payload.files.length);
+    if (options.normalized && Array.isArray(options.normalized.files) && options.normalized.files.length) {
       return options.normalized;
+    }
+    if (hasDirectImportFiles(STATE.lastMiaochuanJsonResult?.normalized)) {
+      return STATE.lastMiaochuanJsonResult.normalized;
     }
     const outputText = String(UI.miaochuanOutput?.value || STATE.lastMiaochuanJsonResult?.outputText || '').trim();
     if (outputText) {
       const payload = safeJsonParse(outputText);
-      if (payload && Array.isArray(payload.files)) {
+      if (hasDirectImportFiles(payload)) {
         return payload;
       }
     }
-    const result = await generateMiaochuanJsonFromPanel();
+    if (getMiaochuanInputText()) {
+      const result = await generateMiaochuanJsonFromPanel();
+      if (hasDirectImportFiles(result.normalized)) {
+        return result.normalized;
+      }
+    }
+    const result = options.fromCurrentPage
+      ? await generateMiaochuanJsonFromCapturedPage(options)
+      : await generateMiaochuanJsonFromPanel();
     return result.normalized;
   }
 
@@ -5882,10 +6911,11 @@
       const file = files[index] || {};
       const path = normalizeMiaochuanPath(file.path || file.name || '', { stripLeadingSlash: false });
       const md5 = normalizeMiaochuanMd5(file.etag || file.md5 || '');
+      const gcid = String(file.gcid || '').trim().toUpperCase();
       const fileSize = normalizeMiaochuanInteger(file.size);
-      if (!path || !md5 || fileSize == null) {
+      if (!path || (!md5 && !gcid) || fileSize == null) {
         summary.skipped += 1;
-        summary.failures.push(`${path || `第 ${index + 1} 项`}：缺少 path / MD5 / size，已跳过`);
+        summary.failures.push(`${path || `第 ${index + 1} 项`}：缺少 path / MD5或GCID / size，已跳过`);
         continue;
       }
       const segments = getMiaochuanPathSegments(path);
@@ -5912,17 +6942,20 @@
       }
 
       try {
+        const tokenBody = {
+          capacity: 1,
+          res: gcid
+            ? { fileSize }
+            : {
+                md5,
+                fileSize,
+              },
+          name: fileName || 'file',
+          parentId: String(targetParentId || ''),
+        };
         const payload = await postGuangyaMiaochuanJson(
           getGuangyaResCenterTokenUrl(),
-          {
-            capacity: 1,
-            res: {
-              md5,
-              fileSize,
-            },
-            name: fileName || 'file',
-            parentId: String(targetParentId || ''),
-          },
+          tokenBody,
           auth,
           { allowedCodes: [GUANGYA_CODE_RES_TOKEN_INSTANT] }
         );
@@ -5932,6 +6965,22 @@
           continue;
         }
         const taskId = findFirstValueByKeys(payload, ['taskId', 'task_id']);
+        if (gcid && taskId) {
+          try {
+            const checkPayload = await postGuangyaMiaochuanJson(
+              getGuangyaCheckFlashUploadUrl(),
+              { taskId: String(taskId), gcid },
+              auth,
+              { allowedCodes: [0] }
+            );
+            if (checkPayload?.data?.canFlashUpload) {
+              summary.success += 1;
+              continue;
+            }
+          } catch (err) {
+            summary.failures.push(`${path}：GCID 秒传检测失败（${getErrorText(err)}）`);
+          }
+        }
         if (taskId) {
           postGuangyaMiaochuanJson(getGuangyaDeleteUploadTaskUrl(), { taskIds: [String(taskId)] }, auth).catch(() => {});
         }
@@ -6245,6 +7294,7 @@
       mode,
       addText: String(UI.fields.addText?.value || ''),
       addPosition: String(UI.fields.addPosition?.value || 'suffix'),
+      addIgnoreExtension: UI.fields.addIgnoreExtension?.checked !== false,
       findText: String(UI.fields.outputFindText?.value || ''),
       replaceText: String(UI.fields.outputReplaceText?.value || ''),
       formatStyle: String(UI.fields.formatStyle?.value || 'text-and-index'),
@@ -6263,6 +7313,10 @@
     if (output.mode === 'add-text') {
       if (!output.addText) {
         return clean;
+      }
+      const ignoreExtension = output.addIgnoreExtension !== false;
+      if (ignoreExtension && output.addPosition === 'suffix' && ext) {
+        return `${base}${output.addText}${ext}`;
       }
       return output.addPosition === 'prefix' ? `${output.addText}${clean}` : `${clean}${output.addText}`;
     }
@@ -6316,7 +7370,7 @@
 
     if (draft.output.mode === 'add-text') {
       return draft.output.addText
-        ? `最终会在名字${draft.output.addPosition === 'prefix' ? '前面' : '后面'}增加“${draft.output.addText}”。`
+        ? `最终会在名字${draft.output.addPosition === 'prefix' ? '前面' : (draft.output.addIgnoreExtension !== false ? '后面（扩展名前）' : '后面')}增加“${draft.output.addText}”。`
         : '增加文字模式下，先填写要增加的内容。';
     }
 
@@ -13410,6 +14464,7 @@
       ruleReplaceText: firstRule.type === 'text' ? (firstRule.replace || '') : '',
       addText: output.addText || '',
       addPosition: output.addPosition || 'suffix',
+      addIgnoreExtension: output.addIgnoreExtension !== false,
       outputFindText: output.findText || '',
       outputReplaceText: output.replaceText || '',
       formatStyle: output.formatStyle || 'text-and-index',
@@ -13426,6 +14481,10 @@
     for (const [key, value] of Object.entries(values)) {
       const el = UI.fields[key];
       if (!el) {
+        continue;
+      }
+      if (el.type === 'checkbox') {
+        el.checked = Boolean(value);
         continue;
       }
       if (!fillEmptyOnly || !el.value) {
@@ -13478,6 +14537,7 @@
     CONFIG.rename.output.mode = UI.fields.outputMode?.value || 'keep-clean';
     CONFIG.rename.output.addText = UI.fields.addText?.value || '';
     CONFIG.rename.output.addPosition = UI.fields.addPosition?.value || 'suffix';
+    CONFIG.rename.output.addIgnoreExtension = UI.fields.addIgnoreExtension?.checked !== false;
     CONFIG.rename.output.findText = UI.fields.outputFindText?.value || '';
     CONFIG.rename.output.replaceText = UI.fields.outputReplaceText?.value || '';
     CONFIG.rename.output.formatStyle = UI.fields.formatStyle?.value || 'text-and-index';
@@ -13575,6 +14635,24 @@
     root?.querySelectorAll?.('.gyp-sections > details.gyp-section').forEach((section) => {
       section.open = false;
     });
+  }
+
+  function buildGuideCard(title, steps = [], note = '') {
+    const stepHtml = (Array.isArray(steps) ? steps : [])
+      .map((step, index) => `
+        <div class="gyp-guide-step">
+          <span class="gyp-guide-number">${index + 1}</span>
+          <span class="gyp-guide-text">${escapeHtml(step)}</span>
+        </div>
+      `)
+      .join('<span class="gyp-guide-arrow" aria-hidden="true">→</span>');
+    return `
+      <div class="gyp-guide-card">
+        <div class="gyp-guide-title">${escapeHtml(title)}</div>
+        <div class="gyp-guide-flow">${stepHtml}</div>
+        ${note ? `<div class="gyp-guide-note">${escapeHtml(note)}</div>` : ''}
+      </div>
+    `;
   }
 
   function createPanel() {
@@ -13734,6 +14812,23 @@
       #gyp-batch-rename-root .gyp-config-actions button.danger {
         background: #d92d20;
         color: #fff;
+      }
+      #gyp-batch-rename-root .gyp-section-actions button[data-variant="primary-step"] {
+        background: linear-gradient(135deg, #155eef, #0f62fe);
+        color: #fff;
+        font-weight: 800;
+        box-shadow: 0 10px 22px rgba(15, 98, 254, 0.22);
+      }
+      #gyp-batch-rename-root .gyp-section-actions button[data-variant="success-step"] {
+        background: linear-gradient(135deg, #119c59, #16a34a);
+        color: #fff;
+        font-weight: 800;
+        box-shadow: 0 10px 22px rgba(22, 163, 74, 0.22);
+      }
+      #gyp-batch-rename-root .gyp-section-actions button[data-variant="primary-step"]:hover,
+      #gyp-batch-rename-root .gyp-section-actions button[data-variant="success-step"]:hover {
+        filter: brightness(1.04);
+        transform: translateY(-1px);
       }
       #gyp-batch-rename-root .gyp-section-actions button[data-action="generate-miaochuan-from-page"] {
         background: linear-gradient(135deg, #155eef, #0f62fe);
@@ -13916,6 +15011,73 @@
         font-size: 11px;
         line-height: 1.5;
         color: #667085;
+      }
+      #gyp-batch-rename-root .gyp-guide-card {
+        padding: 10px;
+        border-radius: 14px;
+        background:
+          radial-gradient(circle at 8% 12%, rgba(15, 98, 254, 0.14), transparent 34%),
+          linear-gradient(135deg, #f8fbff, #eef6ff);
+        border: 1px solid rgba(15, 98, 254, 0.16);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.75);
+      }
+      #gyp-batch-rename-root .gyp-guide-title {
+        font-size: 12px;
+        font-weight: 800;
+        color: #14315f;
+        margin-bottom: 8px;
+      }
+      #gyp-batch-rename-root .gyp-guide-flow {
+        display: flex;
+        align-items: stretch;
+        gap: 6px;
+      }
+      #gyp-batch-rename-root .gyp-guide-step {
+        flex: 1 1 0;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        padding: 8px 9px;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.86);
+        border: 1px solid rgba(15, 23, 42, 0.08);
+      }
+      #gyp-batch-rename-root .gyp-guide-number {
+        flex: 0 0 20px;
+        width: 20px;
+        height: 20px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 999px;
+        background: #0f62fe;
+        color: #fff;
+        font-size: 11px;
+        font-weight: 800;
+      }
+      #gyp-batch-rename-root .gyp-guide-text {
+        min-width: 0;
+        font-size: 11px;
+        line-height: 1.4;
+        color: #23314b;
+        font-weight: 700;
+      }
+      #gyp-batch-rename-root .gyp-guide-arrow {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        color: #0f62fe;
+        font-weight: 800;
+      }
+      #gyp-batch-rename-root .gyp-guide-note {
+        margin-top: 8px;
+        padding: 7px 9px;
+        border-radius: 10px;
+        background: rgba(15, 98, 254, 0.08);
+        color: #475467;
+        font-size: 11px;
+        line-height: 1.45;
       }
       #gyp-batch-rename-root .gyp-miaochuan-diagnosis {
         padding: 10px;
@@ -14279,6 +15441,13 @@
           height: calc(100vh - 92px);
           max-height: calc(100vh - 92px);
         }
+        #gyp-batch-rename-root .gyp-guide-flow {
+          flex-direction: column;
+        }
+        #gyp-batch-rename-root .gyp-guide-arrow {
+          justify-content: center;
+          transform: rotate(90deg);
+        }
       }
     `;
     document.head.appendChild(style);
@@ -14347,7 +15516,7 @@
               <img class="gyp-title-mark" src="https://image.868717.xyz/file/1776301692011_3.svg" alt="" aria-hidden="true" />
               <div class="gyp-title-stack">
                 <div class="gyp-title">光鸭云盘工具</div>
-                <div class="gyp-subtitle">批量直链下载 / 分享直读 / 网盘互通 / 磁力云批量添加 / 移动整理 / 批量改名</div>
+                <div class="gyp-subtitle">批量直链下载（光鸭功能） / 分享直读（夸克、123、天翼、迅雷） / 网盘互通（夸克、123、天翼、百度、迅雷） / 磁力云批量添加（光鸭功能） / 移动整理（光鸭功能） / 批量改名（光鸭功能）</div>
                 <div class="gyp-version">Serenalee (v${SCRIPT_VERSION})</div>
               </div>
             </div>
@@ -14370,12 +15539,13 @@
             <summary>
               <span class="gyp-section-summary">
                 <span class="gyp-section-headline">
-                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">📝</span><span class="gyp-section-title">批量改名</span></span>
+	                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">📝</span><span class="gyp-section-title">批量改名（光鸭功能）</span></span>
                   <span class="gyp-section-desc">预览、执行和规则配置放在一起</span>
                 </span>
               </span>
             </summary>
             <div class="gyp-section-body">
+              ${buildGuideCard('批量改名怎么用', ['选规则和改名方式', '先看示例与预览', '确认后执行改名'], '建议先点“预览”，确认新名字没问题再执行。')}
               <div class="gyp-section-actions">
                 <button type="button" data-action="preview">预览</button>
                 <button type="button" class="secondary" data-action="refresh-preview">刷新改名预览</button>
@@ -14423,6 +15593,13 @@
               <option value="prefix">名称之前</option>
               <option value="suffix">名称之后</option>
             </select>
+          </label>
+          <label class="gyp-field" data-role="output-add-group">
+            <span>增加选项</span>
+            <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:#344054;">
+              <input type="checkbox" data-field="addIgnoreExtension" checked />
+              <span>忽略后缀名（名称之后时加在扩展名前）</span>
+            </label>
           </label>
           <label class="gyp-field" data-role="output-replace-group">
             <span>最终查找文本</span>
@@ -14490,13 +15667,14 @@
             <summary>
               <span class="gyp-section-summary">
                 <span class="gyp-section-headline">
-                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">♻️</span><span class="gyp-section-title">重复项清理</span></span>
+	                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">♻️</span><span class="gyp-section-title">重复项清理（光鸭功能）</span></span>
                   <span class="gyp-section-desc">预览、勾选、取消和删除在同一区</span>
                 </span>
                 <span class="gyp-section-badge" data-role="duplicate-count">删除勾选 0/0</span>
               </span>
             </summary>
             <div class="gyp-section-body">
+              ${buildGuideCard('重复项清理怎么用', ['先预览重复项', '自动勾选或手动调整', '确认后删除'], '删除前可以在列表里取消不想删的项目。')}
               <div class="gyp-section-actions">
                 <button type="button" class="secondary" data-action="preview-duplicates">重复项预览</button>
                 <button type="button" class="secondary" data-action="select-duplicates">勾选重复项</button>
@@ -14525,13 +15703,14 @@
             <summary>
               <span class="gyp-section-summary">
                 <span class="gyp-section-headline">
-                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">📂</span><span class="gyp-section-title">空目录扫描</span></span>
+	                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">📂</span><span class="gyp-section-title">空目录扫描（光鸭功能）</span></span>
                   <span class="gyp-section-desc">扫描结果和删除勾选都放在这里</span>
                 </span>
                 <span class="gyp-section-badge" data-role="empty-dir-count">空目录 0 个</span>
               </span>
             </summary>
             <div class="gyp-section-body">
+              ${buildGuideCard('空目录扫描怎么用', ['扫描空目录', '勾选要删除的目录', '执行删除空目录'], '只处理最里层且完全空的目录。')}
               <div class="gyp-section-actions">
                 <button type="button" class="secondary" data-action="scan-empty-dirs">扫描空目录</button>
               </div>
@@ -14554,16 +15733,17 @@
             <summary>
               <span class="gyp-section-summary">
                 <span class="gyp-section-headline">
-                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">📦</span><span class="gyp-section-title">移动整理</span></span>
+	                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">📦</span><span class="gyp-section-title">移动整理（光鸭功能）</span></span>
                   <span class="gyp-section-desc">基于当前页面已勾选项做移动，不是面板里的勾选</span>
                 </span>
                 <span class="gyp-section-badge" data-role="move-count">当前勾选 0 项</span>
               </span>
             </summary>
             <div class="gyp-section-body">
+              ${buildGuideCard('移动整理怎么用', ['先在网页列表勾选', '读取当前勾选', '选择上移或移到目标目录'], '这里读的是网页里真正勾选的文件/文件夹，不是面板里的勾选。')}
               <div class="gyp-section-actions">
-                <button type="button" class="secondary" data-action="preview-move-selection">读取当前勾选</button>
-                <button type="button" class="secondary" data-action="move-selected-up-one-level">勾选项整体上移一层</button>
+                <button type="button" class="secondary" data-action="preview-move-selection" data-variant="primary-step">读取当前勾选</button>
+                <button type="button" class="secondary" data-action="move-selected-up-one-level" data-variant="success-step">勾选项整体上移一层</button>
                 <button type="button" class="secondary" data-action="move-folder-contents-up">拆开文件夹内容到当前目录</button>
                 <button type="button" class="secondary" data-action="move-selected-to-target">勾选项移到目标目录</button>
               </div>
@@ -14582,16 +15762,17 @@
             <summary>
               <span class="gyp-section-summary">
                 <span class="gyp-section-headline">
-                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">⬇️</span><span class="gyp-section-title">批量直链下载</span></span>
+	                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">⬇️</span><span class="gyp-section-title">批量直链下载（光鸭功能）</span></span>
                   <span class="gyp-section-desc">展开文件夹、逐个取直链，绕过服务器打包</span>
                 </span>
                 <span class="gyp-section-badge" data-role="direct-download-count">待下载 0/0 项</span>
               </span>
             </summary>
             <div class="gyp-section-body">
+              ${buildGuideCard('批量直链下载怎么用', ['打开文件夹并勾选文件', '读取当前勾选并展开', '下载勾选交给下载器'], '如果“源已修改”较多，把每批并发取链数降到 1 或 2。')}
               <div class="gyp-section-actions">
-                <button type="button" class="secondary" data-action="preview-direct-download-selection">读取当前勾选并展开</button>
-                <button type="button" class="secondary" data-action="trigger-direct-download-selection">下载勾选</button>
+                <button type="button" class="secondary" data-action="preview-direct-download-selection" data-variant="primary-step">读取当前勾选并展开</button>
+                <button type="button" class="secondary" data-action="trigger-direct-download-selection" data-variant="success-step">下载勾选</button>
                 <button type="button" class="secondary" data-action="clear-direct-download">清空结果</button>
                 <button type="button" class="secondary" data-action="download-direct-download-md5-size">下载光鸭MD5/Size</button>
               </div>
@@ -14612,17 +15793,18 @@
             <summary>
               <span class="gyp-section-summary">
                 <span class="gyp-section-headline">
-                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">🧲</span><span class="gyp-section-title">磁力云批量添加</span></span>
+	                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">🧲</span><span class="gyp-section-title">磁力云批量添加（光鸭功能）</span></span>
                   <span class="gyp-section-desc">文件选择、上传入口和磁力列表都放在一起</span>
                 </span>
                 <span class="gyp-section-badge" data-role="magnet-file-count">磁力文本 0 个 / 磁力 0 条</span>
               </span>
             </summary>
             <div class="gyp-section-body">
+              ${buildGuideCard('磁力云批量添加怎么用', ['选择TXT/JSON', '检查识别到的磁力', '开始云添加'], '文本里只要包含 magnet 链接，脚本会自动识别并按批次提交。')}
               <div class="gyp-section-actions">
-                <button type="button" class="secondary" data-action="pick-magnet-files" data-keep-enabled="true">选择TXT/JSON</button>
+                <button type="button" class="secondary" data-action="pick-magnet-files" data-keep-enabled="true" data-variant="primary-step">选择TXT/JSON</button>
+                <button type="button" class="secondary" data-action="import-magnets" data-variant="success-step">开始云添加</button>
                 <button type="button" class="secondary" data-action="clear-magnet-files">清空磁力TXT</button>
-                <button type="button" class="secondary" data-action="import-magnets">开始云添加</button>
                 <button type="button" class="secondary" data-action="list-cloud-tasks">查看云任务</button>
               </div>
               <label class="gyp-field">
@@ -14645,22 +15827,23 @@
             <summary>
               <span class="gyp-section-summary">
                 <span class="gyp-section-headline">
-                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">🔗</span><span class="gyp-section-title">分享直读</span></span>
+	                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">🔗</span><span class="gyp-section-title">分享直读（夸克、123、天翼、迅雷）</span></span>
                   <span class="gyp-section-desc">粘贴分享链接、读取目录、勾选后生成或直接导入光鸭</span>
                 </span>
                 <span class="gyp-section-badge" data-role="share-link-count">已选 0/0</span>
               </span>
             </summary>
             <div class="gyp-section-body">
+              ${buildGuideCard('分享直读怎么用', ['粘贴分享链接', '读取链接目录', '勾选后直接导入光鸭'], '适合夸克、123、天翼、迅雷分享链接；迅雷需要先打开分享页一次。')}
               <div class="gyp-section-actions">
-                <button type="button" class="secondary" data-action="read-share-link">读取链接目录</button>
+                <button type="button" class="secondary" data-action="read-share-link" data-variant="primary-step">读取链接目录</button>
+                <button type="button" class="secondary" data-action="import-share-link-to-guangya" data-variant="success-step">按勾选直接导入光鸭</button>
                 <button type="button" class="secondary" data-action="select-all-share-link">全选</button>
                 <button type="button" class="secondary" data-action="clear-all-share-link">全不选</button>
                 <button type="button" class="secondary" data-action="generate-miaochuan-from-share-link">按勾选生成 JSON</button>
-                <button type="button" class="secondary" data-action="import-share-link-to-guangya">按勾选直接导入光鸭</button>
                 <button type="button" class="secondary" data-action="clear-share-link">清空结果</button>
               </div>
-              <div class="gyp-section-note">这是独立于“网盘互通”的新功能。已支持夸克、123 网盘、天翼云盘分享链接直读；123 / 天翼会自动翻页读取完整目录，不再停在第一页 100 项。</div>
+	              <div class="gyp-section-note">这是独立于“网盘互通”的链接直读功能。已支持夸克、123 网盘、天翼云盘、迅雷云盘分享链接直读；123 / 天翼 / 迅雷会自动翻页或递归读取完整目录。迅雷需要先打开并加载对应分享页一次，让脚本捕获登录态和 pass_code_token。</div>
               <label class="gyp-field">
                 <span>分享链接</span>
                 <textarea data-field="shareLinkUrl" class="gyp-miaochuan-log" placeholder="可直接粘贴完整分享链接；如果复制内容里带提取码，也可以一起粘进来。"></textarea>
@@ -14669,9 +15852,9 @@
                 <span>提取码（可选）</span>
                 <input data-field="shareLinkPasscode" placeholder="优先用你这里手填的；留空则尝试从链接或整段文本里自动识别" />
               </label>
-              <label class="gyp-field">
-                <span>夸克 Cookie（仅夸克直读时使用）</span>
-                <textarea data-field="shareLinkQuarkCookie" class="gyp-miaochuan-log" placeholder="可选。夸克分享链接如果提示 token/MD5 获取失败，把浏览器 Network 里的完整 Cookie 粘这里；留空会先尝试复用已保存的 Cookie。"></textarea>
+	              <label class="gyp-field">
+	                <span>夸克 Cookie（仅夸克分享直读使用）</span>
+	                <textarea data-field="shareLinkQuarkCookie" class="gyp-miaochuan-log" placeholder="可选。夸克分享链接如果提示 token/MD5 获取失败，把浏览器 Network 里的完整 Cookie 粘这里；留空会先尝试复用已保存的 Cookie。迅雷不填这里，需要先打开对应迅雷分享页。"></textarea>
               </label>
               <label class="gyp-field">
                 <span>光鸭 Authorization（按勾选直接导入时使用）</span>
@@ -14691,12 +15874,13 @@
             <summary>
               <span class="gyp-section-summary">
                 <span class="gyp-section-headline">
-                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">⚡</span><span class="gyp-section-title">网盘互通</span></span>
+	                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">⚡</span><span class="gyp-section-title">网盘互通（夸克、123、天翼、百度、迅雷）</span></span>
                   <span class="gyp-section-desc">跨网盘来源识别、生成光鸭 JSON、导入失败诊断</span>
                 </span>
               </span>
             </summary>
               <div class="gyp-section-body">
+                ${buildGuideCard('网盘互通怎么用', ['打开来源网盘页面', '抓取生成光鸭JSON', '直接导入光鸭或下载JSON'], '已经有秒传 JSON 时，也可以直接选择文件再生成/导入。')}
                 <div class="gyp-section-actions">
                 <button type="button" class="secondary" data-action="generate-miaochuan-from-page">从当前网页抓取生成</button>
                 <button type="button" class="secondary" data-action="import-miaochuan-to-guangya">直接导入光鸭</button>
@@ -14708,7 +15892,7 @@
                 <button type="button" class="secondary" data-action="copy-miaochuan-report">复制报告</button>
                 <button type="button" class="secondary" data-action="clear-miaochuan-json">清空</button>
               </div>
-              <div class="gyp-section-note">优先用“从当前网页抓取生成”：脚本会捕获夸克 / 123 / 天翼 等页面加载文件列表时返回的数据，自动生成光鸭秒传 JSON。秒传不是上传文件：光鸭会用 MD5 + 大小查服务端库存；库里有才会秒传，库里没有就会显示未命中。</div>
+	              <div class="gyp-section-note">优先用“从当前网页抓取生成”：脚本会捕获或主动读取夸克 / 123 / 天翼 / 百度 / 迅雷 / 光鸭页面里的文件数据，自动生成光鸭秒传 JSON。百度、迅雷更适合在对应网盘页面勾选后使用；迅雷会走 GCID，其他多数来源走 MD5 + size。</div>
               <div class="gyp-inline-help" data-role="miaochuan-captured-count">当前网页已捕获 0 条候选文件；请先让网盘列表加载完成。</div>
               <label class="gyp-field">
                 <span>夸克 Cookie（分享页主动取 MD5 时使用）</span>
@@ -14753,6 +15937,7 @@
               </span>
             </summary>
             <div class="gyp-section-body">
+              ${buildGuideCard('高级与调试怎么用', ['自动抓不到时再打开', '刷新已捕获上下文', '必要时手填认证或规则'], '普通使用不需要改这里；它主要是兜底和排查问题用。')}
               <div class="gyp-section-note">脚本默认优先使用刚刚自动捕获到的认证和目录上下文。只有自动抓不到，或者你要用自定义模板 / 自定义正则时，再展开这里。</div>
               <div class="gyp-config-actions">
                 <button type="button" class="secondary" data-action="fill-captured">刷新已捕获上下文</button>
@@ -14852,6 +16037,7 @@
     UI.fields.ruleReplaceText = root.querySelector('[data-field="ruleReplaceText"]');
     UI.fields.addText = root.querySelector('[data-field="addText"]');
     UI.fields.addPosition = root.querySelector('[data-field="addPosition"]');
+    UI.fields.addIgnoreExtension = root.querySelector('[data-field="addIgnoreExtension"]');
     UI.fields.outputFindText = root.querySelector('[data-field="outputFindText"]');
     UI.fields.outputReplaceText = root.querySelector('[data-field="outputReplaceText"]');
     UI.fields.formatStyle = root.querySelector('[data-field="formatStyle"]');
@@ -15278,8 +16464,9 @@
             UI.miaochuanDetails.open = true;
           }
           await runWithTaskControl('直接导入光鸭', async (taskControl) => {
-            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备直接导入光鸭...' });
+            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备直接导入光鸭；如当前没有 JSON 会先自动生成...' });
             const summary = await importMiaochuanJsonDirectlyToGuangya({
+              fromCurrentPage: true,
               onProgress: (state) => setProgressBar(state),
               taskControl,
             });
@@ -15688,6 +16875,16 @@
       captureMiaochuanSourcePayload(url, requestBody, responseBody);
     }
 
+    if (/api-pan\.xunlei\.com/i.test(url)) {
+      const headers = sanitizeHeaders(detail.headers);
+      if (headers.authorization || headers['x-device-id'] || headers['x-captcha-token'] || headers['x-client-id']) {
+        STATE.lastXunleiHeaders = {
+          ...(STATE.lastXunleiHeaders || {}),
+          ...headers,
+        };
+      }
+    }
+
     if (!url.includes(CONFIG.request.apiHost)) {
       return;
     }
@@ -15750,10 +16947,14 @@
           'drive.quark.cn',
           'drive-pc.quark.cn',
           'pc-api.uc.cn',
-          'cloud.189.cn',
-          '123pan.com',
-          '123pan.cn',
-        ];
+	          'cloud.189.cn',
+	          '123pan.com',
+	          '123pan.cn',
+	          'pan.baidu.com',
+	          'yun.baidu.com',
+	          'pan.xunlei.com',
+	          'api-pan.xunlei.com',
+	        ];
 
         const shouldCapture = (url) => {
           if (typeof url !== 'string' || !url) {
