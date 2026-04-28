@@ -44,8 +44,8 @@
 // @connect      yun.baidu.com
 // @connect      api-pan.xunlei.com
 // @connect      api.guangyapan.com
-// @downloadURL https://update.greasyfork.org/scripts/574046/%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98%E6%89%B9%E9%87%8F%E5%8A%A9%E6%89%8B%20V4.user.js
-// @updateURL https://update.greasyfork.org/scripts/574046/%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98%E6%89%B9%E9%87%8F%E5%8A%A9%E6%89%8B%20V4.meta.js
+// @downloadURL https://github.com/serenalee87/guangya-cloud-helper/blob/main/guangyapan-batch-rename.user.js
+// @updateURL https://github.com/serenalee87/guangya-cloud-helper/blob/main/guangyapan-batch-rename.user.js
 // ==/UserScript==
 
 (function () {
