@@ -298,3 +298,22 @@
 - 脚本管理器：Tampermonkey 或 ScriptCat
 - 下载器：浏览器自带下载、IDM、NDM、Motrix、Aria2、Xdown 等均可配合使用
 
+## 免责声明
+
+- 本项目为个人自用脚本，仅用于提升光鸭云盘网页端的整理效率。
+- 本项目与光鸭云盘、夸克网盘、百度网盘、123 网盘、天翼云盘等平台官方无任何隶属、授权或合作关系。
+- 使用者应自行确认操作内容是否正确，尤其是批量删除、批量改名、批量导入等功能。
+- 因网页结构变化、接口调整、账号状态、网络异常或误操作造成的问题，使用者需自行承担风险。
+- 请勿将本项目用于任何违法、违规或侵犯他人权益的用途。
+
+## 文件说明
+
+- [`guangyapan-batch-rename.user.js`](./guangyapan-batch-rename.user.js)：主脚本文件
+
+## 作者
+
+Serenalee
+
+## License
+
+Copyright (c) 2026 Serena Lee. All rights reserved.
