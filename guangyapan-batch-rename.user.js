@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         光鸭云盘批量助手 V4
 // @namespace    serenalee.guangyapan.batch-helper
-// @version      0.5.78
+// @version      0.5.85
 // @description  为光鸭云盘网页端提供批量重命名、重复项清理、移动整理、磁力云添加、秒传 JSON 转换/诊断、空目录扫描与删除等功能。
 // @author       Serena Lee
 // @license      Copyright (c) 2026 Serena Lee. All rights reserved.
@@ -44,14 +44,16 @@
 // @connect      yun.baidu.com
 // @connect      api-pan.xunlei.com
 // @connect      api.guangyapan.com
-// @downloadURL https://github.com/serenalee87/guangya-cloud-helper/blob/main/guangyapan-batch-rename.user.js
-// @updateURL https://github.com/serenalee87/guangya-cloud-helper/blob/main/guangyapan-batch-rename.user.js
+// @connect      api.themoviedb.org
+// @connect      image.tmdb.org
+// @downloadURL https://update.greasyfork.org/scripts/574046/%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98%E6%89%B9%E9%87%8F%E5%8A%A9%E6%89%8B%20V4.user.js
+// @updateURL https://update.greasyfork.org/scripts/574046/%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98%E6%89%B9%E9%87%8F%E5%8A%A9%E6%89%8B%20V4.meta.js
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.5.78';
+  const SCRIPT_VERSION = '0.5.85';
 
   // =========================
   // 用户配置区：主要改这里
@@ -205,6 +207,19 @@
       targetParentId: '',
       batchSize: 20,
     },
+    mediaOrganize: {
+      tmdbApiKey: '',
+      tmdbLanguage: 'zh-CN',
+      rootParentId: '',
+      useFolderNameFirst: true,
+      includeTitleFolder: true,
+      includeRegionFolder: true,
+      includeSeasonFolder: true,
+      moveBySourceFolder: false,
+      cleanupEmptySourceFolders: true,
+      skipDuplicateTargets: true,
+      batchSize: 10,
+    },
     download: {
       directBatchSize: 3,
       exportFormat: 'aria2',
@@ -242,6 +257,10 @@
     moveSelectionExpectedCount: 0,
     moveSelectionSource: 'visible',
     moveSelectionWarning: '',
+    mediaOrganizePreviewItems: [],
+    mediaOrganizePlan: null,
+    mediaOrganizeWarning: '',
+    tmdbCache: {},
     directDownloadPreviewItems: [],
     directDownloadExpectedCount: 0,
     directDownloadWarning: '',
@@ -287,6 +306,9 @@
     moveDetails: null,
     moveSelectionList: null,
     moveSelectionCount: null,
+    mediaOrganizeDetails: null,
+    mediaOrganizeList: null,
+    mediaOrganizeCount: null,
     directDownloadDetails: null,
     directDownloadList: null,
     directDownloadCount: null,
@@ -669,6 +691,41 @@
             CONFIG.move.batchSize = Math.max(1, Number(saved.move.batchSize));
           }
         }
+        if (saved.mediaOrganize && typeof saved.mediaOrganize === 'object') {
+          if (typeof saved.mediaOrganize.tmdbApiKey === 'string') {
+            CONFIG.mediaOrganize.tmdbApiKey = saved.mediaOrganize.tmdbApiKey;
+          }
+          if (typeof saved.mediaOrganize.rootParentId === 'string') {
+            CONFIG.mediaOrganize.rootParentId = saved.mediaOrganize.rootParentId;
+          }
+          if (typeof saved.mediaOrganize.tmdbLanguage === 'string') {
+            CONFIG.mediaOrganize.tmdbLanguage = saved.mediaOrganize.tmdbLanguage || 'zh-CN';
+          }
+          if (typeof saved.mediaOrganize.useFolderNameFirst === 'boolean') {
+            CONFIG.mediaOrganize.useFolderNameFirst = saved.mediaOrganize.useFolderNameFirst;
+          }
+          if (typeof saved.mediaOrganize.includeTitleFolder === 'boolean') {
+            CONFIG.mediaOrganize.includeTitleFolder = saved.mediaOrganize.includeTitleFolder;
+          }
+          if (typeof saved.mediaOrganize.includeRegionFolder === 'boolean') {
+            CONFIG.mediaOrganize.includeRegionFolder = saved.mediaOrganize.includeRegionFolder;
+          }
+          if (typeof saved.mediaOrganize.includeSeasonFolder === 'boolean') {
+            CONFIG.mediaOrganize.includeSeasonFolder = saved.mediaOrganize.includeSeasonFolder;
+          }
+          if (typeof saved.mediaOrganize.moveBySourceFolder === 'boolean') {
+            CONFIG.mediaOrganize.moveBySourceFolder = saved.mediaOrganize.moveBySourceFolder;
+          }
+          if (typeof saved.mediaOrganize.cleanupEmptySourceFolders === 'boolean') {
+            CONFIG.mediaOrganize.cleanupEmptySourceFolders = saved.mediaOrganize.cleanupEmptySourceFolders;
+          }
+          if (typeof saved.mediaOrganize.skipDuplicateTargets === 'boolean') {
+            CONFIG.mediaOrganize.skipDuplicateTargets = saved.mediaOrganize.skipDuplicateTargets;
+          }
+          if (saved.mediaOrganize.batchSize != null && !Number.isNaN(Number(saved.mediaOrganize.batchSize))) {
+            CONFIG.mediaOrganize.batchSize = Math.max(1, Number(saved.mediaOrganize.batchSize));
+          }
+        }
         if (saved.download && typeof saved.download === 'object') {
           if (saved.download.directBatchSize != null && !Number.isNaN(Number(saved.download.directBatchSize))) {
             CONFIG.download.directBatchSize = Math.max(1, Number(saved.download.directBatchSize));
@@ -719,6 +776,19 @@
         move: {
           targetParentId: CONFIG.move.targetParentId,
           batchSize: CONFIG.move.batchSize,
+        },
+        mediaOrganize: {
+          tmdbApiKey: CONFIG.mediaOrganize.tmdbApiKey,
+          tmdbLanguage: CONFIG.mediaOrganize.tmdbLanguage,
+          rootParentId: CONFIG.mediaOrganize.rootParentId,
+          useFolderNameFirst: CONFIG.mediaOrganize.useFolderNameFirst !== false,
+          includeTitleFolder: CONFIG.mediaOrganize.includeTitleFolder !== false,
+          includeRegionFolder: CONFIG.mediaOrganize.includeRegionFolder !== false,
+          includeSeasonFolder: CONFIG.mediaOrganize.includeSeasonFolder !== false,
+          moveBySourceFolder: CONFIG.mediaOrganize.moveBySourceFolder !== false,
+          cleanupEmptySourceFolders: CONFIG.mediaOrganize.cleanupEmptySourceFolders !== false,
+          skipDuplicateTargets: CONFIG.mediaOrganize.skipDuplicateTargets !== false,
+          batchSize: Math.max(1, Number(CONFIG.mediaOrganize.batchSize || 10)),
         },
         download: {
           directBatchSize: CONFIG.download.directBatchSize,
@@ -1285,6 +1355,17 @@
   function extractCreatedDirId(payload) {
     const value = findFirstValueByKeys(payload, ['dirId', 'dir_id', 'fileId', 'folderId', 'folder_id', 'id']);
     return value == null ? '' : String(value);
+  }
+
+  function isLikelyDirectoryId(value) {
+    const text = String(value == null ? '' : value).trim();
+    if (!text || text === '0') {
+      return false;
+    }
+    if (/^(?:true|false|ok|success|null|undefined)$/iu.test(text)) {
+      return false;
+    }
+    return /^[A-Za-z0-9_-]{6,}$/u.test(text) || /^\d{6,}$/u.test(text);
   }
 
   function collectObjectArrays(node, out = [], seen = new WeakSet()) {
@@ -9687,6 +9768,14 @@
     return true;
   }
 
+  function isDirectoryExistsResponse(payload, response) {
+    const code = String(payload?.code ?? response?.payload?.code ?? '').trim();
+    if (code && code === String(GUANGYA_CODE_DIR_EXISTS)) {
+      return true;
+    }
+    return looksLikeNameExistError(payload || response?.text || response);
+  }
+
   async function renameOne(target) {
     const response = await pageRequest(getRenameUrl(), {
       method: 'POST',
@@ -12493,6 +12582,1653 @@
     };
   }
 
+  const MEDIA_TMDB_HOST = 'api.themoviedb.org';
+  const MEDIA_GENRE = Object.freeze({
+    animation: 16,
+    documentary: 99,
+    reality: 10764,
+    talk: 10767,
+    news: 10763,
+  });
+  const MEDIA_REGION_GROUPS = Object.freeze({
+    cn: new Set(['CN', 'HK', 'TW', 'MO']),
+    jpkr: new Set(['JP', 'KR', 'KP']),
+    western: new Set(['US', 'GB', 'UK', 'FR', 'DE', 'ES', 'IT', 'NL', 'PT', 'RU', 'CA', 'AU', 'IE', 'SE', 'NO', 'DK', 'FI']),
+  });
+  const MEDIA_REGION_LABELS = Object.freeze({
+    CN: '中国大陆',
+    HK: '香港',
+    TW: '台湾',
+    MO: '澳门',
+    JP: '日本',
+    KR: '韩国',
+    KP: '韩国',
+    US: '美国',
+    GB: '英国',
+    UK: '英国',
+    FR: '法国',
+    DE: '德国',
+    ES: '西班牙',
+    IT: '意大利',
+    NL: '荷兰',
+    PT: '葡萄牙',
+    RU: '俄罗斯',
+    CA: '加拿大',
+    AU: '澳大利亚',
+    IE: '爱尔兰',
+    SE: '瑞典',
+    NO: '挪威',
+    DK: '丹麦',
+    FI: '芬兰',
+    IN: '印度',
+    TH: '泰国',
+    SG: '新加坡',
+    MY: '马来西亚',
+    PH: '菲律宾',
+    ID: '印度尼西亚',
+    VN: '越南',
+    MX: '墨西哥',
+    BR: '巴西',
+  });
+  const MEDIA_LANGUAGE_REGION_LABELS = Object.freeze({
+    zh: '华语地区',
+    ja: '日本',
+    ko: '韩国',
+    en: '欧美地区',
+    fr: '法国',
+    de: '德国',
+    es: '西班牙',
+    it: '意大利',
+    pt: '葡萄牙',
+    ru: '俄罗斯',
+    hi: '印度',
+    th: '泰国',
+    vi: '越南',
+    id: '印度尼西亚',
+    ms: '马来西亚',
+  });
+  const MEDIA_REGION_CODE_PRIORITY = Object.freeze([
+    'CN',
+    'HK',
+    'TW',
+    'MO',
+    'JP',
+    'KR',
+    'KP',
+    'US',
+    'GB',
+    'UK',
+    'FR',
+    'DE',
+    'ES',
+    'IT',
+    'RU',
+    'CA',
+    'AU',
+    'IN',
+    'TH',
+    'SG',
+    'MY',
+    'PH',
+    'ID',
+    'VN',
+    'MX',
+    'BR',
+  ]);
+
+  function normalizeMediaText(text) {
+    return String(text || '')
+      .replace(/\u3000/g, ' ')
+      .replace(/[._]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function parseChineseNumber(value) {
+    const text = String(value || '').trim();
+    if (!text) {
+      return null;
+    }
+    if (/^\d+$/.test(text)) {
+      return Number(text);
+    }
+    const map = {
+      零: 0,
+      一: 1,
+      二: 2,
+      两: 2,
+      三: 3,
+      四: 4,
+      五: 5,
+      六: 6,
+      七: 7,
+      八: 8,
+      九: 9,
+      十: 10,
+    };
+    if (!/[一二两三四五六七八九十]/u.test(text)) {
+      return null;
+    }
+    if (text === '十') {
+      return 10;
+    }
+    const parts = text.split('十');
+    if (parts.length === 2) {
+      const tens = parts[0] ? map[parts[0]] || 0 : 1;
+      const ones = parts[1] ? map[parts[1]] || 0 : 0;
+      return tens * 10 + ones;
+    }
+    return map[text] ?? null;
+  }
+
+  function normalizeMediaSeasonNumber(value) {
+    if (value == null || value === '') {
+      return null;
+    }
+    const parsed = /^\d+$/u.test(String(value)) ? Number(value) : parseChineseNumber(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+
+  function parseMediaSeasonRange(text) {
+    const value = normalizeMediaText(text);
+    const patterns = [
+      /\bS(\d{1,2})\s*(?:-|–|—|~|至|到)\s*S?(\d{1,2})\b/iu,
+      /\bSeason\s*(\d{1,2})\s*(?:-|–|—|~|至|到)\s*(?:Season\s*)?(\d{1,2})\b/iu,
+      /第\s*([一二两三四五六七八九十\d]+)\s*(?:-|–|—|~|至|到)\s*([一二两三四五六七八九十\d]+)\s*季/iu,
+    ];
+    for (const pattern of patterns) {
+      const matched = value.match(pattern);
+      if (!matched) {
+        continue;
+      }
+      const start = normalizeMediaSeasonNumber(matched[1]);
+      const end = normalizeMediaSeasonNumber(matched[2]);
+      if (!start || !end) {
+        continue;
+      }
+      const min = Math.min(start, end);
+      const max = Math.max(start, end);
+      if (max > min) {
+        return { start: min, end: max };
+      }
+    }
+    return null;
+  }
+
+  function stripMediaNoiseFromTitle(name) {
+    let work = normalizeMediaText(name);
+    work = work.replace(/\{tmdbid-\d+\}/i, ' ');
+    work = work.replace(/^\s*\d{1,4}\s*[.\-、_]\s*(?=[\u4e00-\u9fa5A-Za-z])/u, '');
+    work = work.replace(/[【\[][^【\]\[]*(?:字幕组|公众号|更多|资源|发布|www\.|com|\.cn|网盘|公众号|微信|微博)[^【\]\[]*[】\]]/giu, ' ');
+    work = work.replace(/[【\[]([^【\]\[]+)[】\]]/gu, ' $1 ');
+    work = work.replace(/\b(?:S\d{1,2}E\d{1,3}|S\d{1,2}|E\d{1,3}|EP\d{1,3}|Episode\s*\d{1,3}|Season\s*\d{1,2})\b.*$/iu, ' ');
+    work = work.replace(/(?:第\s*[一二两三四五六七八九十\d]+\s*[季集期话]|全\s*\d+\s*集).*$/u, ' ');
+    work = work.replace(/\b(?:2160p|1080p|1080i|720p|4k|8k|uhd|blu-?ray|bdrip|web-?dl|webrip|web|hdtv|remux|x264|x265|h264|h265|hevc|avc|aac|ac3|dts|truehd|atmos|hdr10?|dv|dovi|10bit|nf|netflix|amzn|amazon|disney\+|hulu|apple ?tv)\b.*$/iu, ' ');
+    work = work.replace(/(?:国语|粤语|中字|简繁|内封|外挂|双语|多音轨|高码|无删减|未删减|导演剪辑版|完整版|合集|剧集|电影|番剧|动漫).*$/u, ' ');
+    work = work.replace(/[《》"'“”‘’()[\]{}（）]+/g, ' ');
+    work = work.replace(/[-+~]+$/g, ' ');
+    return normalizeMediaText(work);
+  }
+
+  function extractMediaNameInfo(rawName) {
+    const original = String(rawName || '').trim();
+    const base = getBaseName(original) || original;
+    const clean = normalizeMediaText(base);
+    const seasonRange = parseMediaSeasonRange(clean);
+    const seasonMatch = clean.match(/(?:\bS(\d{1,2})(?:E\d{1,3})?\b|第\s*([一二两三四五六七八九十\d]+)\s*季|Season\s*(\d{1,2}))/iu);
+    const episodeMatch = clean.match(/(?:\bS\d{1,2}E(\d{1,3})\b|\bE(?:P)?\s*(\d{1,3})\b|第\s*([一二两三四五六七八九十\d]+)\s*[集期话])/iu);
+    const yearMatches = Array.from(clean.matchAll(/(?:^|[^\d])(19\d{2}|20[0-3]\d)(?=$|[^\d])/g)).map((m) => m[1]);
+    const year = yearMatches.length ? yearMatches[yearMatches.length - 1] : '';
+    const season = seasonRange
+      ? null
+      : seasonMatch
+      ? Number(seasonMatch[1] || seasonMatch[3] || parseChineseNumber(seasonMatch[2]) || 0) || null
+      : null;
+    const episode = episodeMatch
+      ? Number(episodeMatch[1] || episodeMatch[2] || parseChineseNumber(episodeMatch[3]) || 0) || null
+      : null;
+    const explicitTv = Boolean(seasonRange || season || episode || /(?:全\s*\d+\s*集|剧集|电视剧|番剧|动漫|综艺|第\s*[一二两三四五六七八九十\d]+\s*[季集期])/iu.test(clean));
+    const explicitMovie = /(?:电影|movie|film)/iu.test(clean);
+    let title = stripMediaNoiseFromTitle(clean);
+    if (year) {
+      title = normalizeMediaText(title.replace(new RegExp(`(^|\\D)${year}(?=\\D|$)`, 'g'), '$1'));
+    }
+    if (!title && clean) {
+      title = stripMediaNoiseFromTitle(clean.replace(/\.[a-z0-9]{1,12}$/i, ''));
+    }
+    return {
+      rawName: original,
+      title,
+      year,
+      season,
+      seasonRange,
+      episode,
+      explicitType: explicitTv ? 'tv' : (explicitMovie ? 'movie' : ''),
+      isWeakFileName: isWeakMediaFileName(original),
+    };
+  }
+
+  function isWeakMediaFileName(name) {
+    const base = normalizeMediaText(getBaseName(name) || name);
+    if (!base) {
+      return true;
+    }
+    if (/^\d{1,4}$/u.test(base)) {
+      return true;
+    }
+    if (/^(?:s\d{1,2}e\d{1,3}|s\d{1,2}|e\d{1,3}|ep\d{1,3})$/iu.test(base)) {
+      return true;
+    }
+    if (/^(?:e|ep|episode|第)?\s*\d{1,4}\s*(?:集|期|话)?$/iu.test(base)) {
+      return true;
+    }
+    if (/^(?:正片|影片|视频|movie|video|main|feature)$/iu.test(base)) {
+      return true;
+    }
+    return false;
+  }
+
+  function isSeasonOnlyMediaName(name) {
+    const base = normalizeMediaText(getBaseName(name) || name);
+    return /^(?:s\d{1,2}|season\s*\d{1,2}|第\s*[一二两三四五六七八九十\d]+\s*季)$/iu.test(base);
+  }
+
+  function isSeasonFolderItem(item) {
+    return Boolean(item && shouldTreatItemAsDirectory(item) && isSeasonOnlyMediaName(item.name || ''));
+  }
+
+  function isSeasonOnlyMediaInfo(info) {
+    return Boolean(info?.season && !String(info?.title || '').trim() && (isWeakMediaFileName(info.rawName || '') || isSeasonOnlyMediaName(info.rawName || '')));
+  }
+
+  function getCurrentMediaContextInfo() {
+    const currentDirName = getCurrentDirectoryDisplayName();
+    const currentDirInfo = extractMediaNameInfo(currentDirName);
+    if (currentDirInfo.title && !/^(?:当前目录|\(当前目录\)|首页|全部文件|文件)$/u.test(currentDirName)) {
+      return currentDirInfo;
+    }
+
+    const selectors = [
+      '[aria-label*="breadcrumb" i] a',
+      '[aria-label*="breadcrumb" i] button',
+      '[aria-label*="breadcrumb" i] [aria-current="page"]',
+      '[class*="breadcrumb"] a',
+      '[class*="breadcrumb"] button',
+      '[class*="breadcrumb"] [aria-current="page"]',
+      '[class*="crumb"] a',
+      '[class*="crumb"] button',
+      '[class*="crumb"] [aria-current="page"]',
+      '[class*="path"] a',
+      '[class*="path"] button',
+      '[class*="path"] [aria-current="page"]',
+      'nav a',
+      'nav button',
+      'nav [aria-current="page"]',
+    ];
+    const names = Array.from(document.querySelectorAll(selectors.join(',')))
+      .filter((node) => !isHelperPanelNode(node) && isVisibleElement(node))
+      .map((node) => cleanDirectoryTitleCandidate(getVisibleNodeText(node)))
+      .filter((name, index, list) => {
+        if (!isProbablyUsefulName(name) || /^(?:文件|首页|全部文件|\.{3}|…|\(当前目录\))$/u.test(name)) {
+          return false;
+        }
+        return list.indexOf(name) === index;
+      });
+    for (let index = names.length - 1; index >= 0; index -= 1) {
+      const info = extractMediaNameInfo(names[index]);
+      if (info.title) {
+        return info;
+      }
+    }
+    return currentDirInfo;
+  }
+
+  function mergeSeasonFolderInfoWithContext(seasonInfo, contextInfo) {
+    if (!isSeasonOnlyMediaInfo(seasonInfo) || !contextInfo?.title) {
+      return seasonInfo;
+    }
+    return {
+      ...contextInfo,
+      rawName: seasonInfo.rawName,
+      season: seasonInfo.season,
+      episode: seasonInfo.episode || null,
+      explicitType: seasonInfo.explicitType || contextInfo.explicitType || 'tv',
+      isWeakFileName: seasonInfo.isWeakFileName,
+    };
+  }
+
+  function mergeSeasonNumberIntoMediaInfo(baseInfo, seasonInfo) {
+    if (!seasonInfo?.season || !baseInfo?.title) {
+      return baseInfo || seasonInfo;
+    }
+    return {
+      ...baseInfo,
+      rawName: seasonInfo.rawName,
+      season: seasonInfo.season,
+      seasonRange: null,
+      episode: seasonInfo.episode || null,
+      explicitType: baseInfo.explicitType || seasonInfo.explicitType || 'tv',
+      isWeakFileName: seasonInfo.isWeakFileName,
+    };
+  }
+
+  function getMediaTitleComparableName(name) {
+    return normalizeMediaText(String(name || '')
+      .replace(/\s*\((?:19\d{2}|20[0-3]\d)\)\s*$/u, ' ')
+      .replace(/(?:19\d{2}|20[0-3]\d)/gu, ' ')
+      .replace(/[《》"'“”‘’()[\]{}（）]+/g, ' '))
+      .toLowerCase()
+      .replace(/[^a-z0-9\u4e00-\u9fa5]+/giu, '');
+  }
+
+  function isLikelySameMediaTitleName(left, right) {
+    const a = getMediaTitleComparableName(left);
+    const b = getMediaTitleComparableName(right);
+    if (!a || !b) {
+      return false;
+    }
+    return a === b || a.includes(b) || b.includes(a);
+  }
+
+  function getMediaItemIdentity(item) {
+    if (!item) {
+      return '';
+    }
+    return String(item.fileId || normalizeDomName(item.name || '') || '').trim();
+  }
+
+  function buildMediaSourceGroups(items) {
+    const groups = [];
+    const byFolderId = new Map();
+    const currentParentId = String(getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '').trim();
+    const folderFirst = CONFIG.mediaOrganize.useFolderNameFirst !== false;
+    const currentDirName = getCurrentDirectoryDisplayName();
+    const currentDirInfo = extractMediaNameInfo(currentDirName);
+    const mediaContextInfo = getCurrentMediaContextInfo();
+    const weakOnlyItems = [];
+
+    for (const rawItem of Array.isArray(items) ? items : []) {
+      const item = {
+        ...rawItem,
+        isDir: rawItem.isDir === true || shouldTreatItemAsDirectory(rawItem),
+      };
+      const id = getMediaItemIdentity(item);
+      if (!id) {
+        continue;
+      }
+      if (folderFirst && item.isDir) {
+        const info = mergeSeasonFolderInfoWithContext(extractMediaNameInfo(item.name), mediaContextInfo);
+        const moveAsFolder = CONFIG.mediaOrganize.moveBySourceFolder === true;
+        const key = `folder:${item.fileId || item.name}`;
+        byFolderId.set(String(item.fileId || ''), key);
+        groups.push({
+          key,
+          sourceName: item.name,
+          sourceInfo: info,
+          sourceItem: item,
+          items: moveAsFolder ? [item] : [],
+          itemIds: moveAsFolder ? [id] : [],
+          moveAsFolder,
+          parentId: String(item.parentId || currentParentId || ''),
+          needsChildListing: !moveAsFolder,
+        });
+        continue;
+      }
+
+      const parentKey = item.parentId && byFolderId.get(String(item.parentId || ''));
+      if (folderFirst && parentKey) {
+        const group = groups.find((entry) => entry.key === parentKey);
+        if (group) {
+          group.items.push(item);
+          group.itemIds.push(id);
+          continue;
+        }
+      }
+
+      const info = extractMediaNameInfo(item.name);
+      if (folderFirst && !item.isDir && info.isWeakFileName && currentDirInfo.title && !/^(?:当前目录|\(当前目录\)|首页|全部文件)$/u.test(currentDirName)) {
+        weakOnlyItems.push(item);
+        continue;
+      }
+      groups.push({
+        key: `item:${id}`,
+        sourceName: item.name,
+        sourceInfo: info,
+        sourceItem: item,
+        items: [item],
+        itemIds: [id],
+        moveAsFolder: false,
+        parentId: String(item.parentId || currentParentId || ''),
+      });
+    }
+
+    if (weakOnlyItems.length) {
+      groups.unshift({
+        key: `current-folder:${currentParentId || currentDirName}`,
+        sourceName: currentDirName,
+        sourceInfo: currentDirInfo,
+        sourceItem: null,
+        items: weakOnlyItems,
+        itemIds: weakOnlyItems.map((item) => getMediaItemIdentity(item)).filter(Boolean),
+        moveAsFolder: false,
+        parentId: currentParentId,
+      });
+    }
+
+    return groups;
+  }
+
+  function tmdbGet(url) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        reject(new Error('未检测到 GM_xmlhttpRequest 权限，无法直连 TMDB。'));
+        return;
+      }
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        timeout: 30000,
+        onload: (res) => {
+          if (res.status < 200 || res.status >= 300) {
+            reject(new Error(`TMDB HTTP ${res.status}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(res.responseText || '{}'));
+          } catch (err) {
+            reject(new Error(`TMDB 返回不是 JSON：${getErrorText(err)}`));
+          }
+        },
+        onerror: (err) => reject(new Error(`TMDB 网络错误：${getErrorText(err) || '未知错误'}`)),
+        ontimeout: () => reject(new Error('TMDB 请求超时')),
+      });
+    });
+  }
+
+  function getTmdbCacheKey(kind, params) {
+    return `${kind}:${JSON.stringify(params || {})}`;
+  }
+
+  async function fetchTmdbJsonCached(kind, url, params) {
+    const key = getTmdbCacheKey(kind, params);
+    if (STATE.tmdbCache[key]) {
+      return STATE.tmdbCache[key];
+    }
+    const data = await tmdbGet(url);
+    STATE.tmdbCache[key] = data;
+    return data;
+  }
+
+  function getMediaTmdbKey() {
+    return String(CONFIG.mediaOrganize.tmdbApiKey || UI.fields.mediaTmdbApiKey?.value || '').trim();
+  }
+
+  async function searchTmdbMedia(info, options = {}) {
+    const apiKey = getMediaTmdbKey();
+    if (!apiKey) {
+      return null;
+    }
+    const title = String(info?.title || '').trim();
+    if (!title) {
+      return null;
+    }
+
+    const language = String(CONFIG.mediaOrganize.tmdbLanguage || 'zh-CN').trim() || 'zh-CN';
+    const expectedType = options.expectedType || info.explicitType || '';
+    const endpoints = expectedType === 'movie'
+      ? ['movie', 'tv', 'multi']
+      : expectedType === 'tv'
+        ? ['tv', 'movie', 'multi']
+        : ['multi', 'tv', 'movie'];
+    const seen = new Set();
+    let best = null;
+
+    for (const endpoint of endpoints) {
+      if (seen.has(endpoint)) {
+        continue;
+      }
+      seen.add(endpoint);
+      const url = `https://${MEDIA_TMDB_HOST}/3/search/${endpoint}?api_key=${encodeURIComponent(apiKey)}&language=${encodeURIComponent(language)}&query=${encodeURIComponent(title)}&page=1${info.year ? `&year=${encodeURIComponent(info.year)}&first_air_date_year=${encodeURIComponent(info.year)}` : ''}`;
+      const data = await fetchTmdbJsonCached('search', url, { endpoint, title, year: info.year || '', language });
+      const candidates = (data?.results || [])
+        .filter((item) => item && !['person'].includes(item.media_type))
+        .map((item) => normalizeTmdbSearchResult(item, endpoint, info, expectedType))
+        .filter(Boolean)
+        .sort((a, b) => b.score - a.score);
+      if (candidates.length && (!best || candidates[0].score > best.score)) {
+        best = candidates[0];
+      }
+      if (best && best.score >= 175) {
+        break;
+      }
+    }
+
+    if (!best) {
+      return null;
+    }
+    const details = await fetchTmdbDetails(best, apiKey, language);
+    return {
+      ...best,
+      details,
+    };
+  }
+
+  function normalizeTmdbSearchResult(item, endpoint, info, expectedType) {
+    const mediaType = item.media_type || (endpoint === 'movie' || endpoint === 'tv' ? endpoint : '');
+    if (!mediaType || !['movie', 'tv'].includes(mediaType)) {
+      return null;
+    }
+    const title = item.title || item.name || item.original_title || item.original_name || '';
+    const originalTitle = item.original_title || item.original_name || '';
+    const date = item.release_date || item.first_air_date || '';
+    const year = date ? String(date).slice(0, 4) : '';
+    const normalizedQuery = normalizeMediaText(info.title).toLowerCase();
+    const normalizedTitle = normalizeMediaText(title).toLowerCase();
+    const normalizedOriginal = normalizeMediaText(originalTitle).toLowerCase();
+    let score = 0;
+    if (expectedType && mediaType === expectedType) {
+      score += 90;
+    }
+    if (info.year && year === String(info.year)) {
+      score += 80;
+    } else if (info.year && year && Math.abs(Number(year) - Number(info.year)) <= 1) {
+      score += 28;
+    }
+    if (normalizedTitle === normalizedQuery || normalizedOriginal === normalizedQuery) {
+      score += 80;
+    } else if (normalizedTitle.includes(normalizedQuery) || normalizedOriginal.includes(normalizedQuery)) {
+      score += 36;
+    }
+    score += Math.min(40, Number(item.popularity || 0));
+    score += Math.round(Number(item.vote_count || 0) > 0 ? Math.min(25, Math.log(Number(item.vote_count || 0) + 1) * 4) : 0);
+    return {
+      id: item.id,
+      mediaType,
+      title,
+      originalTitle,
+      year,
+      poster: item.poster_path ? `https://image.tmdb.org/t/p/w92${item.poster_path}` : '',
+      score,
+      raw: item,
+    };
+  }
+
+  async function fetchTmdbDetails(result, apiKey, language) {
+    if (!result?.id || !result?.mediaType) {
+      return null;
+    }
+    const url = `https://${MEDIA_TMDB_HOST}/3/${result.mediaType}/${result.id}?api_key=${encodeURIComponent(apiKey)}&language=${encodeURIComponent(language)}`;
+    return fetchTmdbJsonCached('details', url, { type: result.mediaType, id: result.id, language });
+  }
+
+  function getTmdbGenreIds(tmdb) {
+    const source = tmdb?.details || tmdb?.raw || {};
+    const genreIds = [];
+    if (Array.isArray(source.genres)) {
+      genreIds.push(...source.genres.map((item) => Number(item.id)).filter(Number.isFinite));
+    }
+    if (Array.isArray(source.genre_ids)) {
+      genreIds.push(...source.genre_ids.map(Number).filter(Number.isFinite));
+    }
+    return Array.from(new Set(genreIds));
+  }
+
+  function getTmdbRegions(tmdb) {
+    const source = tmdb?.details || tmdb?.raw || {};
+    const values = [
+      ...(Array.isArray(source.origin_country) ? source.origin_country : []),
+      source.production_countries?.[0]?.iso_3166_1,
+      ...(Array.isArray(source.production_countries) ? source.production_countries.map((item) => item.iso_3166_1) : []),
+    ];
+    return Array.from(new Set(values.map((item) => String(item || '').trim().toUpperCase()).filter(Boolean)));
+  }
+
+  function getTmdbLanguage(tmdb) {
+    const source = tmdb?.details || tmdb?.raw || {};
+    return String(source.original_language || '').trim().toLowerCase();
+  }
+
+  function classifyMediaByTmdb(tmdb, info) {
+    const genreIds = getTmdbGenreIds(tmdb);
+    const regions = getTmdbRegions(tmdb);
+    const language = getTmdbLanguage(tmdb);
+    const mediaType = tmdb?.mediaType || tmdb?.media_type || info?.explicitType || '';
+    const regionGroup = getMediaRegionGroup(regions, language);
+    const regionLabel = getMediaRegionLabel(regions, language);
+    const nameText = `${info?.rawName || ''} ${info?.title || ''}`.toLowerCase();
+    let category = '其他';
+    let subCategory = '未识别';
+
+    if (mediaType === 'movie') {
+      category = '电影';
+      if (genreIds.includes(MEDIA_GENRE.animation)) {
+        subCategory = '动画电影';
+      } else if (regionGroup === 'cn') {
+        subCategory = '华语电影';
+      } else if (regionGroup === 'jpkr') {
+        subCategory = '日韩电影';
+      } else if (regionGroup === 'western') {
+        subCategory = '欧美电影';
+      } else {
+        subCategory = '其他电影';
+      }
+    } else if (mediaType === 'tv') {
+      const looksVariety = genreIds.includes(MEDIA_GENRE.reality) || genreIds.includes(MEDIA_GENRE.talk) || /综艺|真人秀|脱口秀|晚会|演唱会|episode|ep\b|第.+期/iu.test(nameText);
+      const looksAnime = genreIds.includes(MEDIA_GENRE.animation) || /动漫|动画|番剧|新番|日番|国漫|baha|crunchyroll|\bcr\b/iu.test(nameText);
+      if (looksVariety) {
+        category = '综艺';
+        subCategory = regionGroup === 'cn' ? '内地综艺' : (regionGroup === 'jpkr' ? '日韩综艺' : (regionGroup === 'western' ? '欧美综艺' : '其他综艺'));
+      } else if (looksAnime) {
+        category = '动漫';
+        subCategory = regionGroup === 'cn' ? '国漫' : (regionGroup === 'jpkr' ? '日番' : (regionGroup === 'western' ? '欧美动画' : '其他动漫'));
+      } else {
+        category = '电视剧';
+        subCategory = regionGroup === 'cn' ? '国产剧' : (regionGroup === 'jpkr' ? '日韩剧' : (regionGroup === 'western' ? '欧美剧' : '其他剧'));
+      }
+    }
+
+    return {
+      category,
+      subCategory,
+      regionGroup,
+      regionLabel,
+      genreIds,
+      regions,
+      language,
+    };
+  }
+
+  function getMediaRegionGroup(regions, language) {
+    const set = new Set((regions || []).map((item) => String(item || '').toUpperCase()));
+    if ([...set].some((item) => MEDIA_REGION_GROUPS.cn.has(item)) || ['zh', 'cn', 'bo', 'za'].includes(language)) {
+      return 'cn';
+    }
+    if ([...set].some((item) => MEDIA_REGION_GROUPS.jpkr.has(item)) || ['ja', 'ko'].includes(language)) {
+      return 'jpkr';
+    }
+    if ([...set].some((item) => MEDIA_REGION_GROUPS.western.has(item)) || ['en', 'fr', 'de', 'es', 'it', 'nl', 'pt', 'ru'].includes(language)) {
+      return 'western';
+    }
+    return 'other';
+  }
+
+  function getMediaLanguageRegionPriority(language) {
+    const lang = String(language || '').trim().toLowerCase();
+    if (lang === 'zh') return ['CN', 'HK', 'TW', 'MO'];
+    if (lang === 'ja') return ['JP'];
+    if (lang === 'ko') return ['KR', 'KP'];
+    if (lang === 'en') return ['US', 'GB', 'UK', 'CA', 'AU', 'IE'];
+    if (lang === 'fr') return ['FR', 'CA'];
+    if (lang === 'de') return ['DE'];
+    if (lang === 'es') return ['ES', 'MX'];
+    if (lang === 'pt') return ['PT', 'BR'];
+    if (lang === 'ru') return ['RU'];
+    if (lang === 'hi') return ['IN'];
+    if (lang === 'th') return ['TH'];
+    if (lang === 'vi') return ['VN'];
+    if (lang === 'id') return ['ID'];
+    if (lang === 'ms') return ['MY', 'SG'];
+    return [];
+  }
+
+  function getMediaRegionLabel(regions, language) {
+    const codes = Array.from(new Set((regions || [])
+      .map((item) => String(item || '').trim().toUpperCase())
+      .filter(Boolean)));
+    if (codes.length) {
+      const langPriority = getMediaLanguageRegionPriority(language);
+      const preferredCode = [...langPriority, ...MEDIA_REGION_CODE_PRIORITY, ...codes].find((code) => codes.includes(code) && MEDIA_REGION_LABELS[code]);
+      if (preferredCode) {
+        return MEDIA_REGION_LABELS[preferredCode];
+      }
+    }
+    const lang = String(language || '').trim().toLowerCase();
+    return MEDIA_LANGUAGE_REGION_LABELS[lang] || '其他地区';
+  }
+
+  function buildLocalMediaText(info) {
+    return normalizeMediaText([
+      info?.rawName || '',
+      info?.title || '',
+    ].join(' ')).toLowerCase();
+  }
+
+  function localTextHas(text, patterns) {
+    return patterns.some((pattern) => pattern.test(text));
+  }
+
+  function detectLocalRegionGroup(text) {
+    const cnStrong = [
+      /(^|[^a-z])(?:cn|chn|china)([^a-z]|$)/iu,
+      /华语|国产|国剧|陆剧|大陆|内地|中国|香港|港剧|台湾|台剧|港片|台片|国漫/iu,
+    ];
+    const jpkrStrong = [
+      /(^|[^a-z])(?:jp|jpn|japanese|kr|kor|korean)([^a-z]|$)/iu,
+      /日韩|日本|日剧|日影|日番|日漫|韩剧|韩综|韩国|韩影|韩语|日语|baha|bahamut|ani-one|crunchyroll|b-global/iu,
+    ];
+    const westernStrong = [
+      /(^|[^a-z])(?:us|usa|uk|gb|eng|english|fr|fra|deu|ger|esp|ita|can|aus)([^a-z]|$)/iu,
+      /欧美|美国|美剧|英剧|英国|法国|法剧|德国|德剧|西班牙|意大利|加拿大|澳洲|澳大利亚|俄罗斯|俄剧/iu,
+    ];
+
+    if (localTextHas(text, cnStrong)) {
+      return 'cn';
+    }
+    if (localTextHas(text, jpkrStrong)) {
+      return 'jpkr';
+    }
+    if (localTextHas(text, westernStrong)) {
+      return 'western';
+    }
+    return 'other';
+  }
+
+  function detectLocalRegionLabel(text, regionGroup = 'other') {
+    const rules = [
+      {
+        label: '香港',
+        patterns: [
+          /香港|港剧|港片|港综|粤语|粤配|粵語|粵配/iu,
+          /(^|[^a-z])(?:hk|hong\s*kong)([^a-z]|$)/iu,
+        ],
+      },
+      {
+        label: '台湾',
+        patterns: [
+          /台湾|臺灣|台剧|台劇|台片|台综|台綜/iu,
+          /(^|[^a-z])(?:tw|taiwan)([^a-z]|$)/iu,
+        ],
+      },
+      {
+        label: '澳门',
+        patterns: [/澳门|澳門|(^|[^a-z])mo([^a-z]|$)/iu],
+      },
+      {
+        label: '中国大陆',
+        patterns: [
+          /中国大陆|大陆|内地|內地|国产|国剧|國劇|陆剧|陸劇|国漫|國漫|内地综艺|內地綜藝/iu,
+          /(^|[^a-z])(?:cn|chn|china|mainland)([^a-z]|$)/iu,
+        ],
+      },
+      {
+        label: '日本',
+        patterns: [
+          /日本|日剧|日劇|日影|日番|日漫|日综|日綜|日语|日語/iu,
+          /(^|[^a-z])(?:jp|jpn|japanese|japan)([^a-z]|$)/iu,
+        ],
+      },
+      {
+        label: '韩国',
+        patterns: [
+          /韩国|韓國|韩剧|韓劇|韩影|韓影|韩综|韓綜|韩语|韓語/iu,
+          /(^|[^a-z])(?:kr|kor|korean|korea)([^a-z]|$)/iu,
+        ],
+      },
+      {
+        label: '美国',
+        patterns: [
+          /美国|美國|美剧|美劇|美影|好莱坞|好萊塢/iu,
+          /(^|[^a-z])(?:us|usa|american|america)([^a-z]|$)/iu,
+        ],
+      },
+      {
+        label: '英国',
+        patterns: [
+          /英国|英國|英剧|英劇|英影|英综|英綜/iu,
+          /(^|[^a-z])(?:uk|gb|british|england)([^a-z]|$)/iu,
+        ],
+      },
+      {
+        label: '法国',
+        patterns: [/法国|法國|法剧|法劇|法影|(^|[^a-z])(?:fr|fra|french|france)([^a-z]|$)/iu],
+      },
+      {
+        label: '德国',
+        patterns: [/德国|德國|德剧|德劇|德影|(^|[^a-z])(?:de|deu|ger|german|germany)([^a-z]|$)/iu],
+      },
+      {
+        label: '西班牙',
+        patterns: [/西班牙|西剧|西劇|西影|(^|[^a-z])(?:es|esp|spanish|spain)([^a-z]|$)/iu],
+      },
+      {
+        label: '意大利',
+        patterns: [/意大利|意剧|意劇|意影|(^|[^a-z])(?:it|ita|italian|italy)([^a-z]|$)/iu],
+      },
+      {
+        label: '俄罗斯',
+        patterns: [/俄罗斯|俄羅斯|俄剧|俄劇|俄影|(^|[^a-z])(?:ru|rus|russian|russia)([^a-z]|$)/iu],
+      },
+      {
+        label: '加拿大',
+        patterns: [/加拿大|加剧|加劇|(^|[^a-z])(?:ca|can|canadian|canada)([^a-z]|$)/iu],
+      },
+      {
+        label: '澳大利亚',
+        patterns: [/澳大利亚|澳大利亞|澳洲|澳剧|澳劇|(^|[^a-z])(?:au|aus|australian|australia)([^a-z]|$)/iu],
+      },
+      {
+        label: '印度',
+        patterns: [/印度|宝莱坞|寶萊塢|(^|[^a-z])(?:in|ind|hindi|india|indian)([^a-z]|$)/iu],
+      },
+      {
+        label: '泰国',
+        patterns: [/泰国|泰國|泰剧|泰劇|泰影|泰语|泰語|(^|[^a-z])(?:th|tha|thai|thailand)([^a-z]|$)/iu],
+      },
+      {
+        label: '新加坡',
+        patterns: [/新加坡|星剧|星劇|(^|[^a-z])(?:sg|singapore)([^a-z]|$)/iu],
+      },
+      {
+        label: '马来西亚',
+        patterns: [/马来西亚|馬來西亞|大马|大馬|(^|[^a-z])(?:my|malaysia|malay)([^a-z]|$)/iu],
+      },
+      {
+        label: '越南',
+        patterns: [/越南|(^|[^a-z])(?:vn|vietnam|vietnamese)([^a-z]|$)/iu],
+      },
+      {
+        label: '菲律宾',
+        patterns: [/菲律宾|菲律賓|(^|[^a-z])(?:ph|philippines|filipino)([^a-z]|$)/iu],
+      },
+      {
+        label: '印度尼西亚',
+        patterns: [/印度尼西亚|印尼|印尼剧|印尼劇|(^|[^a-z])(?:id|indonesia|indonesian)([^a-z]|$)/iu],
+      },
+      {
+        label: '墨西哥',
+        patterns: [/墨西哥|墨剧|墨劇|(^|[^a-z])(?:mx|mexico|mexican)([^a-z]|$)/iu],
+      },
+      {
+        label: '巴西',
+        patterns: [/巴西|巴剧|巴劇|(^|[^a-z])(?:br|brazil|brazilian)([^a-z]|$)/iu],
+      },
+      {
+        label: '华语地区',
+        patterns: [/华语|華語/iu],
+      },
+      {
+        label: '日韩地区',
+        patterns: [/日韩|日韓|东亚|東亞/iu],
+      },
+      {
+        label: '欧美地区',
+        patterns: [/欧美|歐美|西方|western/iu],
+      },
+    ];
+
+    const matched = rules.find((rule) => localTextHas(text, rule.patterns));
+    if (matched) {
+      return matched.label;
+    }
+    if (regionGroup === 'cn') return '华语地区';
+    if (regionGroup === 'jpkr') return '日韩地区';
+    if (regionGroup === 'western') return '欧美地区';
+    return '其他地区';
+  }
+
+  function getLocalSubCategory(category, regionGroup, text, flags = {}) {
+    if (category === '电影') {
+      if (flags.anime || /动画电影|动画片|剧场版|animation|anime movie/iu.test(text)) {
+        return '动画电影';
+      }
+      if (regionGroup === 'cn') return '华语电影';
+      if (regionGroup === 'jpkr') return '日韩电影';
+      if (regionGroup === 'western') return '欧美电影';
+      return '其他电影';
+    }
+    if (category === '电视剧') {
+      if (regionGroup === 'cn') return '国产剧';
+      if (regionGroup === 'jpkr') return '日韩剧';
+      if (regionGroup === 'western') return '欧美剧';
+      return '其他剧';
+    }
+    if (category === '综艺') {
+      if (regionGroup === 'cn') return '内地综艺';
+      if (regionGroup === 'jpkr') return '日韩综艺';
+      if (regionGroup === 'western') return '欧美综艺';
+      return '其他综艺';
+    }
+    if (category === '动漫') {
+      if (regionGroup === 'cn') return '国漫';
+      if (regionGroup === 'western') return '欧美动画';
+      if (regionGroup === 'jpkr') return '日番';
+      return '其他动漫';
+    }
+    return '未识别';
+  }
+
+  function classifyMediaByLocalRules(info) {
+    const text = buildLocalMediaText(info);
+    const regionGroup = detectLocalRegionGroup(text);
+    const regionLabel = detectLocalRegionLabel(text, regionGroup);
+    const hasSeasonEpisode = Boolean(info?.season || info?.episode || /(?:\bs\d{1,2}e\d{1,3}\b|\bs\d{1,2}\b|\be(?:p)?\d{1,3}\b|第\s*[一二两三四五六七八九十\d]+\s*[集季话]|全\s*\d+\s*集)/iu.test(text));
+    const looksVariety = /综艺|真人秀|脱口秀|访谈|访谈节目|选秀|竞演|喜剧大赛|歌手|哥哥|姐姐|晚会|春晚|演唱会|音乐会|第\s*[一二两三四五六七八九十\d]+\s*期|\b\d{8}\b|\b20\d{2}[.\-_]\d{1,2}[.\-_]\d{1,2}\b/iu.test(text);
+    const looksAnime = /动漫|动画|番剧|新番|日番|国漫|日漫|美漫|ova|oad|baha|bahamut|ani-one|crunchyroll|b-global|\bani\b/iu.test(text);
+    const looksMovie = /电影|影片|movie|film|剧场版|theatrical|bluray|bdrip|remux/iu.test(text);
+    const looksTv = hasSeasonEpisode || /电视剧|剧集|连续剧|迷你剧|短剧|season|episode|series|drama|web-?dl/iu.test(text);
+    const looksDocumentary = /纪录片|documentary|docu|bbc|national geographic|ngc|discovery/iu.test(text);
+
+    let category = '其他';
+    let confidence = 18;
+    if (looksVariety) {
+      category = '综艺';
+      confidence = 64;
+    } else if (looksAnime && !looksMovie) {
+      category = '动漫';
+      confidence = 66;
+    } else if (looksDocumentary && hasSeasonEpisode) {
+      category = '电视剧';
+      confidence = 58;
+    } else if (looksDocumentary) {
+      category = '电影';
+      confidence = 50;
+    } else if (looksTv || info?.explicitType === 'tv') {
+      category = '电视剧';
+      confidence = hasSeasonEpisode ? 68 : 52;
+    } else if (looksMovie || info?.explicitType === 'movie' || info?.year) {
+      category = '电影';
+      confidence = info?.year ? 56 : 46;
+    } else if (looksAnime) {
+      category = '动漫';
+      confidence = 52;
+    }
+
+    const subCategory = getLocalSubCategory(category, regionGroup, text, { anime: looksAnime });
+    if (regionGroup !== 'other') {
+      confidence += 10;
+    }
+    if (info?.title) {
+      confidence += 6;
+    }
+    if (info?.year) {
+      confidence += 6;
+    }
+    return {
+      category,
+      subCategory,
+      regionGroup,
+      regionLabel,
+      genreIds: [],
+      regions: [],
+      language: '',
+      source: 'local',
+      confidence: Math.max(10, Math.min(86, confidence)),
+    };
+  }
+
+  function shouldIncludeMediaRegionFolder(classification = {}) {
+    if (CONFIG.mediaOrganize.includeRegionFolder === false) {
+      return false;
+    }
+    const regionLabel = String(classification.regionLabel || '').trim();
+    if (!regionLabel || regionLabel === '其他地区') {
+      return false;
+    }
+    const subCategory = String(classification.subCategory || '').trim();
+    const groupedSubCategories = new Set([
+      '华语电影',
+      '日韩电影',
+      '欧美电影',
+      '国产剧',
+      '日韩剧',
+      '欧美剧',
+      '内地综艺',
+      '日韩综艺',
+      '欧美综艺',
+      '国漫',
+      '日番',
+      '欧美动画',
+    ]);
+    return !groupedSubCategories.has(subCategory);
+  }
+
+  function getMediaClassificationDisplay(item = {}) {
+    const classification = item.classification || {};
+    const parts = [
+      classification.category || '其他',
+      classification.subCategory || '未识别',
+    ];
+    if (shouldIncludeMediaRegionFolder(classification)) {
+      parts.push(classification.regionLabel || '其他地区');
+    }
+    return parts.join(' / ');
+  }
+
+  function buildMediaTargetPath(classification, tmdb, info) {
+    const segments = [
+      classification.category || '其他',
+      classification.subCategory || '未识别',
+    ];
+    if (shouldIncludeMediaRegionFolder(classification)) {
+      segments.push(classification.regionLabel || '其他地区');
+    }
+    if (CONFIG.mediaOrganize.includeTitleFolder !== false && tmdb?.title) {
+      const yearPart = tmdb.year && tmdb.year !== 'N/A' ? ` (${tmdb.year})` : (info?.year ? ` (${info.year})` : '');
+      segments.push(`${tmdb.title}${yearPart}`);
+    } else if (CONFIG.mediaOrganize.includeTitleFolder !== false && info?.title) {
+      segments.push(`${info.title}${info.year ? ` (${info.year})` : ''}`);
+    }
+    const season = info?.season || null;
+    if (CONFIG.mediaOrganize.includeSeasonFolder !== false && season && ['电视剧', '动漫', '综艺'].includes(classification.category)) {
+      segments.push(`Season ${String(season).padStart(2, '0')}`);
+    }
+    return segments.map((segment) => sanitizeCloudDirName(segment, '未识别')).filter(Boolean);
+  }
+
+  async function resolveMediaGroupMoveItems(group, options = {}) {
+    if (!group?.needsChildListing || group.moveAsFolder) {
+      return group;
+    }
+    const taskControl = options.taskControl || null;
+    const includeSeasonFolder = CONFIG.mediaOrganize.includeSeasonFolder !== false;
+    const folderId = String(group.sourceItem?.fileId || group.sourceItem?.dirId || '').trim();
+    if (!folderId) {
+      return {
+        ...group,
+        moveAsFolder: true,
+        items: group.sourceItem ? [group.sourceItem] : group.items,
+        itemIds: group.sourceItem?.fileId ? [String(group.sourceItem.fileId)] : group.itemIds,
+        needsChildListing: false,
+      };
+    }
+    const listing = await fetchDirectoryItems(folderId, {
+      idCandidates: normalizeIdCandidates([folderId, group.sourceItem?.dirId, ...(group.sourceItem?.dirIdCandidates || [])]),
+      taskControl,
+      pageSize: Math.max(100, Number(CONFIG.request.manualListBody.pageSize || 100)),
+      maxPages: 50,
+    });
+    const childItems = (listing.items || []).filter((item) => item && getMediaItemIdentity(item));
+    const childDirs = childItems.filter((item) => shouldTreatItemAsDirectory(item));
+    const childFiles = childItems.filter((item) => !shouldTreatItemAsDirectory(item));
+    const singleWrapperDir = childDirs.length === 1 && childFiles.length === 0 ? childDirs[0] : null;
+    if (
+      singleWrapperDir
+      && !isSeasonFolderItem(singleWrapperDir)
+      && group.sourceInfo?.title
+      && isLikelySameMediaTitleName(singleWrapperDir.name || '', group.sourceInfo.title)
+    ) {
+      const wrapperId = String(singleWrapperDir.fileId || singleWrapperDir.dirId || '').trim();
+      if (wrapperId) {
+        const wrapperListing = await fetchDirectoryItems(wrapperId, {
+          idCandidates: normalizeIdCandidates([wrapperId, singleWrapperDir.dirId, ...(singleWrapperDir.dirIdCandidates || [])]),
+          taskControl,
+          pageSize: Math.max(100, Number(CONFIG.request.manualListBody.pageSize || 100)),
+          maxPages: 50,
+        });
+        const wrapperItems = (wrapperListing.items || []).filter((item) => item && getMediaItemIdentity(item));
+        if (wrapperItems.length) {
+          return {
+            ...group,
+            items: wrapperItems,
+            itemIds: wrapperItems.map((item) => getMediaItemIdentity(item)).filter(Boolean),
+            moveAsFolder: false,
+            needsChildListing: false,
+            childListingTruncated: Boolean(listing.truncated || wrapperListing.truncated),
+            unwrappedSourceFolders: [singleWrapperDir],
+          };
+        }
+      }
+    }
+    const seasonFolderItems = includeSeasonFolder
+      ? childItems
+        .filter((item) => {
+          if (!isSeasonFolderItem(item)) {
+            return false;
+          }
+          const info = extractMediaNameInfo(item.name || '');
+          return Boolean(info.season);
+        })
+        .sort((left, right) => (extractMediaNameInfo(left.name || '').season || 0) - (extractMediaNameInfo(right.name || '').season || 0))
+      : [];
+    if (seasonFolderItems.length > 1) {
+      return {
+        ...group,
+        items: seasonFolderItems,
+        itemIds: seasonFolderItems.map((item) => getMediaItemIdentity(item)).filter(Boolean),
+        moveAsFolder: true,
+        needsChildListing: false,
+        seasonFolderGroups: seasonFolderItems.map((item) => {
+          const seasonInfo = extractMediaNameInfo(item.name || '');
+          return {
+            ...group,
+            key: `${group.key || 'season-folder'}:${getMediaItemIdentity(item)}`,
+            sourceName: `${group.sourceName || ''}/${item.name || ''}`.replace(/^\/+/, ''),
+            sourceInfo: mergeSeasonNumberIntoMediaInfo(group.sourceInfo, seasonInfo),
+            sourceItem: item,
+            items: [],
+            itemIds: [],
+            moveAsFolder: false,
+            parentId: String(item.parentId || folderId || group.parentId || ''),
+            needsChildListing: true,
+            parentGroupName: group.sourceName || '',
+            parentSourceItem: group.sourceItem || null,
+          };
+        }),
+      };
+    }
+    if (!childItems.length) {
+      return {
+        ...group,
+        moveAsFolder: true,
+        items: group.sourceItem ? [group.sourceItem] : group.items,
+        itemIds: group.sourceItem?.fileId ? [String(group.sourceItem.fileId)] : group.itemIds,
+        needsChildListing: false,
+        childListingWarning: '未读取到子项目，已退回为移动整个文件夹',
+      };
+    }
+    return {
+      ...group,
+      items: childItems,
+      itemIds: childItems.map((item) => getMediaItemIdentity(item)).filter(Boolean),
+      moveAsFolder: false,
+      needsChildListing: false,
+      childListingTruncated: Boolean(listing.truncated),
+    };
+  }
+
+  async function analyzeMediaSourceGroup(group, options = {}) {
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const infoCandidates = [];
+    const sourceInfoHasSeasonRange = Boolean(group.sourceInfo?.seasonRange && !group.sourceInfo?.season);
+    if (CONFIG.mediaOrganize.useFolderNameFirst !== false && group.sourceInfo?.title) {
+      infoCandidates.push(group.sourceInfo);
+    }
+    for (const item of group.items || []) {
+      const info = extractMediaNameInfo(item.name || '');
+      if (sourceInfoHasSeasonRange && isSeasonOnlyMediaInfo(info)) {
+        continue;
+      }
+      if (!info.isWeakFileName || !infoCandidates.length) {
+        infoCandidates.push(info);
+      }
+    }
+    if (!infoCandidates.length && group.sourceInfo) {
+      infoCandidates.push(group.sourceInfo);
+    }
+    let info = infoCandidates.find((item) => item.title && item.year) || infoCandidates.find((item) => item.title) || group.sourceInfo || extractMediaNameInfo(group.sourceName);
+    if (group.sourceInfo?.season && group.sourceInfo.season !== info?.season && (isWeakMediaFileName(group.sourceName || group.sourceInfo.rawName || '') || isSeasonOnlyMediaName(group.sourceName || group.sourceInfo.rawName || ''))) {
+      info = {
+        ...info,
+        season: group.sourceInfo.season,
+        seasonRange: null,
+        episode: group.sourceInfo.episode || info?.episode || null,
+        explicitType: info?.explicitType || group.sourceInfo.explicitType || 'tv',
+      };
+    }
+
+    let tmdb = null;
+    let error = '';
+    try {
+      if (getMediaTmdbKey() && info?.title) {
+        if (onProgress) {
+          onProgress({
+            visible: true,
+            percent: 0,
+            indeterminate: true,
+            text: `正在识别媒体：${shortDisplayName(info.title || group.sourceName, 34)}${info.year ? ` (${info.year})` : ''}`,
+          });
+        }
+        tmdb = await searchTmdbMedia(info);
+      }
+    } catch (err) {
+      error = getErrorText(err);
+      warn('TMDB 识别失败：', err);
+    }
+
+    const classification = tmdb ? classifyMediaByTmdb(tmdb, info) : classifyMediaByLocalRules(info);
+    const confidence = tmdb
+      ? Math.max(55, Math.min(99, Math.round((tmdb.score || 0) / 2)))
+      : (classification.confidence || (info.title ? 38 : 12));
+    const targetSegments = buildMediaTargetPath(classification, tmdb, info);
+    return {
+      ...group,
+      info,
+      tmdb,
+      classification,
+      confidence,
+      targetSegments,
+      targetPath: targetSegments.join('/'),
+      error,
+    };
+  }
+
+  async function ensureCloudDirectoryPath(segments, rootParentId, options = {}) {
+    let parentId = String(rootParentId || '');
+    const cache = options.cache || new Map();
+    for (const segment of segments || []) {
+      const dirName = sanitizeCloudDirName(segment, '未识别');
+      const cacheKey = `${parentId}::${dirName}`;
+      if (cache.has(cacheKey) && isLikelyDirectoryId(cache.get(cacheKey))) {
+        parentId = String(cache.get(cacheKey) || '');
+        continue;
+      }
+      const existingDirId = await findChildDirectoryIdByName(parentId, dirName, options);
+      if (existingDirId) {
+        cache.set(cacheKey, existingDirId);
+        parentId = existingDirId;
+        continue;
+      }
+      const response = await postJson(
+        getCreateDirUrl(),
+        {
+          dirName,
+          parentId,
+          failIfNameExist: true,
+        },
+        getRequestHeaders()
+      );
+      if (!response.ok || !isProbablySuccess(response.payload, response)) {
+        const existingFromPayload = extractCreatedDirId(response.payload);
+        if (isLikelyDirectoryId(existingFromPayload)) {
+          cache.set(cacheKey, existingFromPayload);
+          parentId = existingFromPayload;
+          continue;
+        }
+        const existingAfterCreateError = await findChildDirectoryIdByName(parentId, dirName, options);
+        if (existingAfterCreateError) {
+          cache.set(cacheKey, existingAfterCreateError);
+          parentId = existingAfterCreateError;
+          continue;
+        }
+        if (isDirectoryExistsResponse(response.payload, response)) {
+          throw new Error(`目录已存在但未能定位目录 ID：${dirName}。请进入或刷新整理根目录，让脚本捕获目录列表后再试。`);
+        }
+        throw new Error(`创建目录失败：${dirName} | ${getErrorText(response.payload || response.text || `HTTP ${response.status}`)}`);
+      }
+      let dirId = extractCreatedDirId(response.payload);
+      if (!isLikelyDirectoryId(dirId)) {
+        dirId = '';
+      }
+      for (let retry = 0; !dirId && retry < 4; retry += 1) {
+        if (retry > 0) {
+          await controlledDelay(350 * retry, options.taskControl || null);
+        }
+        const confirmedDirId = await findChildDirectoryIdByName(parentId, dirName, options);
+        if (isLikelyDirectoryId(confirmedDirId)) {
+          dirId = confirmedDirId;
+        }
+      }
+      if (!dirId) {
+        throw new Error(`创建目录成功但未确认目录 ID：${dirName}`);
+      }
+      cache.set(cacheKey, dirId);
+      parentId = dirId;
+    }
+    return parentId;
+  }
+
+  function findChildDirectoryIdByNameFromCached(parentId, dirName) {
+    const normalizedName = normalizeDomName(dirName);
+    if (!normalizedName) {
+      return '';
+    }
+    const candidates = [
+      ...getCapturedItemsByParentId(parentId),
+      ...(String(parentId || '') === String(getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '').trim() ? getCapturedItems() : []),
+    ];
+    const matched = dedupeItems(candidates).find((item) => {
+      if (!item || !shouldTreatItemAsDirectory(item)) {
+        return false;
+      }
+      return normalizeDomName(item.name || '') === normalizedName;
+    });
+    const cachedId = String(matched?.fileId || matched?.dirId || '').trim();
+    return isLikelyDirectoryId(cachedId) ? cachedId : '';
+  }
+
+  async function findChildDirectoryIdByName(parentId, dirName, options = {}) {
+    const normalizedName = normalizeDomName(dirName);
+    if (!normalizedName) {
+      return '';
+    }
+    const cached = findChildDirectoryIdByNameFromCached(parentId, dirName);
+    if (cached) {
+      return cached;
+    }
+    try {
+      const listing = await fetchDirectoryItemsByParentId(parentId, {
+        pageSize: Math.max(100, Number(CONFIG.request.manualListBody.pageSize || 100)),
+        maxPages: 10,
+        delayMs: 0,
+        taskControl: options.taskControl || null,
+      });
+      const matched = (listing.items || []).find((item) => {
+        if (!item || !shouldTreatItemAsDirectory(item)) {
+          return false;
+        }
+        return normalizeDomName(item.name || '') === normalizedName;
+      });
+      const matchedId = String(matched?.fileId || matched?.dirId || '').trim();
+      return isLikelyDirectoryId(matchedId) ? matchedId : '';
+    } catch (err) {
+      warn('查找已存在目录失败：', err);
+      return '';
+    }
+  }
+
+  async function listMediaDirectoryChildren(parentId, options = {}) {
+    if (!parentId) {
+      return [];
+    }
+    const listing = await fetchDirectoryItemsByParentId(parentId, {
+      pageSize: Math.max(100, Number(CONFIG.request.manualListBody.pageSize || 100)),
+      maxPages: 20,
+      delayMs: 0,
+      taskControl: options.taskControl || null,
+    });
+    return listing.items || [];
+  }
+
+  async function filterMediaItemsAlreadyInTarget(items, targetParentId, options = {}) {
+    const source = (Array.isArray(items) ? items : []).filter((item) => item && getMediaItemIdentity(item));
+    if (!source.length || CONFIG.mediaOrganize.skipDuplicateTargets === false) {
+      return { moveItems: source, duplicateItems: [] };
+    }
+    const targetItems = await listMediaDirectoryChildren(targetParentId, options);
+    const targetNames = new Set(targetItems.map((item) => normalizeDomName(item?.name || '')).filter(Boolean));
+    const duplicateItems = [];
+    const moveItems = [];
+    for (const item of source) {
+      const name = normalizeDomName(item.name || '');
+      if (name && targetNames.has(name)) {
+        duplicateItems.push(item);
+      } else {
+        moveItems.push(item);
+      }
+    }
+    return { moveItems, duplicateItems };
+  }
+
+  async function deleteMediaSourceFoldersIfEmpty(groups, options = {}) {
+    if (CONFIG.mediaOrganize.cleanupEmptySourceFolders === false) {
+      return { deleted: 0, skipped: 0, failed: 0, failures: [] };
+    }
+    const taskControl = options.taskControl || null;
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const candidates = [];
+    const seen = new Set();
+    for (const group of Array.isArray(groups) ? groups : []) {
+      const sourceItem = group?.sourceItem || null;
+      const id = String(sourceItem?.fileId || sourceItem?.dirId || '').trim();
+      if (!id || seen.has(id) || !shouldTreatItemAsDirectory(sourceItem)) {
+        continue;
+      }
+      seen.add(id);
+      candidates.push(sourceItem);
+    }
+    const result = { deleted: 0, skipped: 0, failed: 0, failures: [] };
+    for (let index = 0; index < candidates.length; index += 1) {
+      await waitForTaskControl(taskControl);
+      const folder = candidates[index];
+      const folderId = String(folder.fileId || folder.dirId || '').trim();
+      try {
+        const children = await listMediaDirectoryChildren(folderId, { taskControl });
+        if (children.length) {
+          result.skipped += 1;
+          continue;
+        }
+        if (onProgress) {
+          onProgress({
+            visible: true,
+            percent: 100,
+            indeterminate: true,
+            text: `正在清理空源文件夹 ${index + 1}/${candidates.length}：${shortDisplayName(folder.name, 34)}`,
+          });
+        }
+        const deleteRes = await deleteFiles([folderId]);
+        if (!deleteRes.ok || !isProbablySuccess(deleteRes.payload, deleteRes)) {
+          throw new Error(getErrorText(deleteRes.payload || deleteRes.text || `HTTP ${deleteRes.status}`));
+        }
+        const taskId = extractTaskId(deleteRes.payload);
+        if (taskId) {
+          const task = await waitTaskUntilDone(taskId, {
+            onProgress,
+            taskControl,
+            expectedTotal: 1,
+            maxTries: Math.min(Math.max(CONFIG.batch.taskPollMaxTries || 12, 12), 24),
+            intervalMs: Math.max(CONFIG.batch.taskPollMs || 1500, 1500),
+          });
+          if (!task.ok) {
+            throw new Error(`删除空源文件夹任务未确认完成，taskId: ${taskId}`);
+          }
+        }
+        result.deleted += 1;
+        removeCapturedItemsByIds([folderId]);
+      } catch (err) {
+        result.failed += 1;
+        result.failures.push(`${folder.name || folderId}：${getErrorText(err) || '未知错误'}`);
+        warn('清理空源文件夹失败：', err);
+      }
+    }
+    return result;
+  }
+
+  function renderMediaOrganizeList() {
+    if (!UI.mediaOrganizeList || !UI.mediaOrganizeCount) {
+      return;
+    }
+    const items = Array.isArray(STATE.mediaOrganizePreviewItems) ? STATE.mediaOrganizePreviewItems : [];
+    const warning = String(STATE.mediaOrganizeWarning || '').trim();
+    UI.mediaOrganizeCount.textContent = items.length ? `待整理 ${items.length} 组` : '待整理 0 组';
+    if (!items.length) {
+      UI.mediaOrganizeList.innerHTML = `
+        ${warning ? `<div class="gyp-import-empty">${escapeHtml(warning)}</div>` : ''}
+        <div class="gyp-import-empty">勾选文件夹或文件后点“识别并预览”，这里会显示分类和目标目录。</div>
+      `;
+      return;
+    }
+    UI.mediaOrganizeList.innerHTML = `
+      ${warning ? `<div class="gyp-import-empty">${escapeHtml(warning)}</div>` : ''}
+      ${items.map((item) => `
+        <div class="gyp-import-row">
+          <div class="gyp-import-name" title="${escapeHtml(item.sourceName || '')}">${escapeHtml(item.sourceName || '')}</div>
+          <div class="gyp-import-meta">
+            ${escapeHtml(item.tmdb?.title || item.info?.title || '未识别标题')}${item.tmdb?.year || item.info?.year ? ` (${escapeHtml(item.tmdb?.year || item.info?.year)})` : ''}
+            | ${escapeHtml(getMediaClassificationDisplay(item))}
+            | 置信度 ${escapeHtml(String(item.confidence || 0))}%
+          </div>
+          <div class="gyp-import-meta"><span class="gyp-import-target">目标：${escapeHtml(item.targetPath || '其他/未识别')}</span> | ${item.moveAsFolder ? '移动整个文件夹' : `移动 ${item.itemIds?.length || 0} 项`}${item.error ? ` | TMDB: ${escapeHtml(item.error)}` : ''}</div>
+        </div>
+      `).join('')}
+    `;
+  }
+
+  async function previewMediaOrganizeSelection(options = {}) {
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const taskControl = options.taskControl || null;
+    const selection = await collectResolvedCheckedMoveItems({
+      onlyDirectories: false,
+      onProgress,
+      taskControl,
+      includeMeta: true,
+      allowPartialVisible: true,
+      partialUsageLabel: '智能整理预览',
+    });
+    const checkedItems = selection.items || [];
+    if (!checkedItems.length) {
+      throw new Error('当前页面没有勾选任何可整理的文件或文件夹。');
+    }
+    const groups = buildMediaSourceGroups(checkedItems);
+    const analyzed = [];
+    for (let index = 0; index < groups.length; index += 1) {
+      await waitForTaskControl(taskControl);
+      if (onProgress) {
+        onProgress({
+          visible: true,
+          percent: Math.round((index / Math.max(1, groups.length)) * 70),
+          indeterminate: true,
+          text: `正在识别媒体 ${index + 1}/${groups.length}：${shortDisplayName(groups[index].sourceName, 34)}`,
+        });
+      }
+      const resolvedGroup = await resolveMediaGroupMoveItems(groups[index], { taskControl });
+      const analyzeTargets = Array.isArray(resolvedGroup.seasonFolderGroups) && resolvedGroup.seasonFolderGroups.length
+        ? resolvedGroup.seasonFolderGroups
+        : [resolvedGroup];
+      for (const targetGroup of analyzeTargets) {
+        const finalGroup = targetGroup.needsChildListing
+          ? await resolveMediaGroupMoveItems(targetGroup, { taskControl })
+          : targetGroup;
+        analyzed.push(await analyzeMediaSourceGroup(finalGroup, { onProgress }));
+      }
+    }
+    STATE.mediaOrganizePreviewItems = analyzed;
+    STATE.mediaOrganizeWarning = selection.meta?.warning || '';
+    STATE.mediaOrganizePlan = {
+      createdAt: Date.now(),
+      rootParentId: getMediaOrganizeRootParentId(),
+      groups: analyzed,
+    };
+    renderMediaOrganizeList();
+    if (UI.mediaOrganizeDetails) {
+      UI.mediaOrganizeDetails.open = true;
+    }
+    return analyzed;
+  }
+
+  function getMediaOrganizeRootParentId() {
+    return String(CONFIG.mediaOrganize.rootParentId || UI.fields.mediaRootParentId?.value || getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '').trim();
+  }
+
+  async function executeMediaOrganizePlan(options = {}) {
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const taskControl = options.taskControl || null;
+    const groups = Array.isArray(STATE.mediaOrganizePreviewItems) && STATE.mediaOrganizePreviewItems.length
+      ? STATE.mediaOrganizePreviewItems
+      : await previewMediaOrganizeSelection(options);
+    if (!groups.length) {
+      throw new Error('当前没有可执行的智能整理预览。');
+    }
+    const rootParentId = getMediaOrganizeRootParentId();
+    const summaryText = groups.slice(0, 8).map((item) => `${item.sourceName} -> ${item.targetPath || '其他/未识别'}`).join('\n');
+    if (CONFIG.batch.confirmBeforeRun && !window.confirm(`准备按智能识别整理 ${groups.length} 组内容：\n${summaryText}${groups.length > 8 ? `\n...另有 ${groups.length - 8} 组` : ''}\n\n整理根目录：${rootParentId || '光鸭根目录'}\n是否继续？`)) {
+      return { ok: 0, fail: 0, groups };
+    }
+
+    const dirCache = new Map();
+    const result = {
+      ok: 0,
+      fail: 0,
+      groups,
+      movedFileIds: [],
+      failures: [],
+      duplicateSkipped: 0,
+      cleanup: null,
+    };
+    for (let index = 0; index < groups.length; index += 1) {
+      await waitForTaskControl(taskControl);
+      const group = groups[index];
+      if (onProgress) {
+        onProgress({
+          visible: true,
+          percent: Math.round((index / Math.max(1, groups.length)) * 100),
+          indeterminate: true,
+          text: `正在整理 ${index + 1}/${groups.length}：${shortDisplayName(group.sourceName, 34)} -> ${group.targetPath}`,
+        });
+      }
+      try {
+        const targetParentId = await ensureCloudDirectoryPath(group.targetSegments || ['其他', '未识别'], rootParentId, { cache: dirCache, taskControl });
+        const sourceItems = group.moveAsFolder && group.sourceItem?.fileId
+          ? [group.sourceItem]
+          : (Array.isArray(group.items) && group.items.length
+            ? group.items
+            : (group.itemIds || []).map((id) => ({ fileId: String(id || '') })));
+        const duplicateCheck = await filterMediaItemsAlreadyInTarget(sourceItems, targetParentId, { taskControl });
+        if (duplicateCheck.duplicateItems.length) {
+          result.duplicateSkipped += duplicateCheck.duplicateItems.length;
+          result.fail += duplicateCheck.duplicateItems.length;
+          result.failures.push(`${group.sourceName}：目标目录已有同名项目，已跳过 ${duplicateCheck.duplicateItems.length} 项`);
+        }
+        const ids = Array.from(new Set(duplicateCheck.moveItems.map((item) => getMediaItemIdentity(item)).filter(Boolean)));
+        if (!ids.length) {
+          continue;
+        }
+        const moved = await moveFilesInBatches(ids, targetParentId, {
+          onProgress,
+          taskControl,
+          label: `智能整理：${shortDisplayName(group.sourceName, 18)}`,
+          batchSize: Math.max(1, Number(CONFIG.mediaOrganize.batchSize || CONFIG.move.batchSize || 10)),
+          verifySourceItems: duplicateCheck.moveItems || [],
+        });
+        result.ok += moved.ok;
+        result.fail += moved.fail;
+        result.movedFileIds.push(...(moved.movedFileIds || []));
+        if (moved.firstError) {
+          result.failures.push(`${group.sourceName}：${moved.firstError}`);
+        }
+      } catch (err) {
+        result.fail += Math.max(1, group.itemIds?.length || 1);
+        result.failures.push(`${group.sourceName}：${getErrorText(err) || '未知错误'}`);
+        warn('智能整理失败：', err);
+        if (CONFIG.batch.stopOnError) {
+          break;
+        }
+      }
+    }
+    if (result.movedFileIds.length) {
+      removeCapturedItemsByIds(result.movedFileIds);
+    }
+    const cleanupGroups = groups.filter((group) => {
+      const sourceId = String(group.sourceItem?.fileId || group.sourceItem?.dirId || '').trim();
+      if (!sourceId || !shouldTreatItemAsDirectory(group.sourceItem)) {
+        return false;
+      }
+      const groupIds = Array.from(new Set((group.itemIds || []).map((id) => String(id || '').trim()).filter(Boolean)));
+      return groupIds.length > 0 && groupIds.every((id) => result.movedFileIds.includes(id));
+    });
+    for (const group of groups) {
+      const unwrapped = Array.isArray(group.unwrappedSourceFolders) ? group.unwrappedSourceFolders : [];
+      for (const folder of unwrapped) {
+        const folderId = String(folder?.fileId || folder?.dirId || '').trim();
+        if (!folderId || !shouldTreatItemAsDirectory(folder)) {
+          continue;
+        }
+        cleanupGroups.push({
+          sourceItem: folder,
+          itemIds: [folderId],
+          sourceName: folder.name || folderId,
+          parentSourceItem: group.sourceItem || null,
+          parentGroupName: group.sourceName || '',
+        });
+      }
+    }
+    const cleanupParentItems = [];
+    const cleanupParentSeen = new Set();
+    for (const group of cleanupGroups) {
+      const parentItem = group.parentSourceItem || null;
+      const parentId = String(parentItem?.fileId || parentItem?.dirId || '').trim();
+      if (!parentId || cleanupParentSeen.has(parentId) || !shouldTreatItemAsDirectory(parentItem)) {
+        continue;
+      }
+      cleanupParentSeen.add(parentId);
+      cleanupParentItems.push({
+        sourceItem: parentItem,
+        itemIds: [parentId],
+        sourceName: parentItem.name || group.parentGroupName || parentId,
+      });
+    }
+    result.cleanup = await deleteMediaSourceFoldersIfEmpty(cleanupGroups, { onProgress, taskControl });
+    if (cleanupParentItems.length) {
+      const parentCleanup = await deleteMediaSourceFoldersIfEmpty(cleanupParentItems, { onProgress, taskControl });
+      result.cleanup = {
+        deleted: (result.cleanup?.deleted || 0) + (parentCleanup.deleted || 0),
+        skipped: (result.cleanup?.skipped || 0) + (parentCleanup.skipped || 0),
+        failed: (result.cleanup?.failed || 0) + (parentCleanup.failed || 0),
+        failures: [...(result.cleanup?.failures || []), ...(parentCleanup.failures || [])],
+      };
+    }
+    if (onProgress) {
+      const cleanupText = result.cleanup?.deleted ? `，清理空文件夹 ${result.cleanup.deleted} 个` : '';
+      const duplicateText = result.duplicateSkipped ? `，跳过重复 ${result.duplicateSkipped} 项` : '';
+      onProgress({
+        visible: true,
+        percent: 100,
+        indeterminate: false,
+        text: `智能整理完成：成功 ${result.ok} 项，失败 ${result.fail} 项${duplicateText}${cleanupText}`,
+      });
+    }
+    return result;
+  }
+
   async function run(options = {}) {
     const targets = await preview(options);
     const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
@@ -14458,6 +16194,17 @@
       cloudBatchLimit: String(CONFIG.cloud.maxFilesPerTask || 500),
       cloudDirPrefix: CONFIG.cloud.sourceDirPrefix || '磁力导入',
       moveTargetParentId: CONFIG.move.targetParentId || '',
+      mediaTmdbApiKey: CONFIG.mediaOrganize.tmdbApiKey || '',
+      mediaRootParentId: CONFIG.mediaOrganize.rootParentId || '',
+      mediaTmdbLanguage: CONFIG.mediaOrganize.tmdbLanguage || 'zh-CN',
+      mediaUseFolderNameFirst: CONFIG.mediaOrganize.useFolderNameFirst !== false,
+      mediaIncludeTitleFolder: CONFIG.mediaOrganize.includeTitleFolder !== false,
+      mediaIncludeRegionFolder: CONFIG.mediaOrganize.includeRegionFolder !== false,
+      mediaIncludeSeasonFolder: CONFIG.mediaOrganize.includeSeasonFolder !== false,
+      mediaMoveBySourceFolder: CONFIG.mediaOrganize.moveBySourceFolder !== false,
+      mediaCleanupEmptySourceFolders: CONFIG.mediaOrganize.cleanupEmptySourceFolders !== false,
+      mediaSkipDuplicateTargets: CONFIG.mediaOrganize.skipDuplicateTargets !== false,
+      mediaBatchSize: String(CONFIG.mediaOrganize.batchSize || 10),
       directDownloadBatchSize: String(CONFIG.download.directBatchSize || 3),
       directDownloadExportFormat: normalizeDirectDownloadExportFormat(CONFIG.download.exportFormat),
       ruleSearchText: firstRule.type === 'text' ? (firstRule.search || '') : '',
@@ -14556,6 +16303,18 @@
     CONFIG.cloud.maxFilesPerTask = Number.isFinite(cloudBatchLimit) && cloudBatchLimit > 0 ? Math.max(1, cloudBatchLimit) : 500;
     CONFIG.cloud.sourceDirPrefix = (UI.fields.cloudDirPrefix?.value || '磁力导入').trim() || '磁力导入';
     CONFIG.move.targetParentId = (UI.fields.moveTargetParentId?.value || '').trim();
+    CONFIG.mediaOrganize.tmdbApiKey = (UI.fields.mediaTmdbApiKey?.value || '').trim();
+    CONFIG.mediaOrganize.rootParentId = (UI.fields.mediaRootParentId?.value || '').trim();
+    CONFIG.mediaOrganize.tmdbLanguage = (UI.fields.mediaTmdbLanguage?.value || 'zh-CN').trim() || 'zh-CN';
+    CONFIG.mediaOrganize.useFolderNameFirst = UI.fields.mediaUseFolderNameFirst?.checked !== false;
+    CONFIG.mediaOrganize.includeTitleFolder = UI.fields.mediaIncludeTitleFolder?.checked !== false;
+    CONFIG.mediaOrganize.includeRegionFolder = UI.fields.mediaIncludeRegionFolder?.checked !== false;
+    CONFIG.mediaOrganize.includeSeasonFolder = UI.fields.mediaIncludeSeasonFolder?.checked !== false;
+    CONFIG.mediaOrganize.moveBySourceFolder = UI.fields.mediaMoveBySourceFolder?.checked !== false;
+    CONFIG.mediaOrganize.cleanupEmptySourceFolders = UI.fields.mediaCleanupEmptySourceFolders?.checked !== false;
+    CONFIG.mediaOrganize.skipDuplicateTargets = UI.fields.mediaSkipDuplicateTargets?.checked !== false;
+    const mediaBatchSize = Number(UI.fields.mediaBatchSize?.value || 10);
+    CONFIG.mediaOrganize.batchSize = Number.isFinite(mediaBatchSize) && mediaBatchSize > 0 ? Math.max(1, mediaBatchSize) : 10;
     const directDownloadBatchSize = Number(UI.fields.directDownloadBatchSize?.value || 3);
     CONFIG.download.directBatchSize = Number.isFinite(directDownloadBatchSize) && directDownloadBatchSize > 0 ? Math.max(1, directDownloadBatchSize) : 3;
     CONFIG.download.exportFormat = normalizeDirectDownloadExportFormat(UI.fields.directDownloadExportFormat?.value || CONFIG.download.exportFormat);
@@ -14618,6 +16377,7 @@
       'share-link-details',
       'miaochuan-details',
       'magnet-details',
+      'media-organize-details',
       'move-details',
       'rename-details',
       'duplicate-details',
@@ -15296,6 +17056,19 @@
         margin-top: 2px;
         flex: 0 0 auto;
       }
+      #gyp-batch-rename-root .gyp-check-field {
+        flex-direction: row;
+        align-items: flex-start;
+        gap: 8px;
+      }
+      #gyp-batch-rename-root .gyp-check-field input[type="checkbox"] {
+        width: auto;
+        margin-top: 2px;
+        flex: 0 0 auto;
+      }
+      #gyp-batch-rename-root .gyp-check-field span {
+        line-height: 1.45;
+      }
       #gyp-batch-rename-root .gyp-duplicate-name {
         font-size: 12px;
         line-height: 1.45;
@@ -15356,6 +17129,10 @@
       #gyp-batch-rename-root .gyp-import-empty {
         padding: 12px 10px;
         margin-top: 0;
+      }
+      #gyp-batch-rename-root .gyp-import-target {
+        color: #16803c;
+        font-weight: 700;
       }
       #gyp-batch-rename-root .gyp-empty-dir-list {
         max-height: 280px;
@@ -15758,6 +17535,79 @@
               </div>
             </div>
           </details>
+          <details class="gyp-section" data-role="media-organize-details">
+            <summary>
+              <span class="gyp-section-summary">
+                <span class="gyp-section-headline">
+                  <span class="gyp-section-title-line"><span class="gyp-section-icon" aria-hidden="true">🎬</span><span class="gyp-section-title">媒体智能整理（光鸭功能）</span></span>
+                  <span class="gyp-section-desc">按文件夹名优先识别电影、电视剧、综艺、动漫并移动到分类目录</span>
+                </span>
+                <span class="gyp-section-badge" data-role="media-organize-count">待整理 0 组</span>
+              </span>
+            </summary>
+            <div class="gyp-section-body">
+              ${buildGuideCard('媒体智能整理怎么用', ['勾选文件夹/文件', '识别并预览', '确认后自动建目录并移动'], '点击识别并预览会出现卡顿现象，属于正常读取现象，等待一会儿即可;识别准确率会因为命名有所区别，确认好再入库;每次识别数量不建议太多，不然会引起网盘卡顿或识别时间过长，建议分批次是识别入库。')}
+              <div class="gyp-section-actions">
+                <button type="button" class="secondary" data-action="preview-media-organize" data-variant="primary-step">识别并预览</button>
+                <button type="button" class="secondary" data-action="run-media-organize" data-variant="success-step">按预览整理</button>
+                <button type="button" class="secondary" data-action="clear-media-organize">清空预览</button>
+              </div>
+              <label class="gyp-field">
+                <span>TMDB API Key（可选，但强烈建议）</span>
+                <input data-field="mediaTmdbApiKey" type="password" placeholder="留空时只用本地规则粗分；填写后浏览器直连 TMDB 识别标题/年份/地区/类型" />
+                <div class="gyp-inline-help">获取方式：登录 themoviedb.org 后进入 Settings -> API，申请 Developer / v3 API Key，复制生成的 API Key 填到这里。</div>
+              </label>
+              <label class="gyp-field">
+                <span>TMDB 语言</span>
+                <select data-field="mediaTmdbLanguage">
+                  <option value="zh-CN">简体中文 zh-CN</option>
+                  <option value="zh-HK">繁体中文 zh-HK</option>
+                  <option value="zh-TW">繁体中文 zh-TW</option>
+                  <option value="en-US">English en-US</option>
+                </select>
+              </label>
+              <label class="gyp-field">
+                <span>整理根目录 parentId</span>
+                <input data-field="mediaRootParentId" placeholder="留空默认用当前目录；建议填“媒体库根目录”的 parentId" />
+              </label>
+              <label class="gyp-field gyp-check-field">
+                <input data-field="mediaUseFolderNameFirst" type="checkbox" />
+                <span>文件夹命名优先：适合外层是片名，里面是 1.mp4 / 2.mkv 的网盘资源</span>
+              </label>
+              <label class="gyp-field gyp-check-field">
+                <input data-field="mediaIncludeTitleFolder" type="checkbox" />
+                <span>目标目录包含片名年份层，例如 电视剧/国产剧/中国大陆/剧名 (2025)</span>
+              </label>
+              <label class="gyp-field gyp-check-field">
+                <input data-field="mediaIncludeRegionFolder" type="checkbox" />
+                <span>增加国家/地区层：仅在子分类没有表达地区时使用，避免 欧美剧/美国 这类重复路径</span>
+              </label>
+              <label class="gyp-field gyp-check-field">
+                <input data-field="mediaIncludeSeasonFolder" type="checkbox" />
+                <span>剧集/动漫/综艺带季数时增加 Season 01 层</span>
+              </label>
+              <label class="gyp-field gyp-check-field">
+                <input data-field="mediaMoveBySourceFolder" type="checkbox" />
+                <span>直接移动原始文件夹本身；默认关闭，会读取文件夹内容后把里面的文件移动到规范目录</span>
+              </label>
+              <label class="gyp-field gyp-check-field">
+                <input data-field="mediaSkipDuplicateTargets" type="checkbox" />
+                <span>目标目录已有同名项目时跳过，不覆盖、不删除源文件</span>
+              </label>
+              <label class="gyp-field gyp-check-field">
+                <input data-field="mediaCleanupEmptySourceFolders" type="checkbox" />
+                <span>移动成功后自动删除已确认为空的源文件夹</span>
+              </label>
+              <label class="gyp-field">
+                <span>移动批大小</span>
+                <input data-field="mediaBatchSize" placeholder="默认 10" />
+              </label>
+              <div class="gyp-inline-help">分类规则：movie -> 电影；tv + 动画类型 -> 动漫；tv + 真人秀/脱口秀 -> 综艺；其他 tv -> 电视剧。不填 TMDB Key 时，会按文件夹名里的年份、季集、综艺/动漫/国家关键词做本地粗分。</div>
+              <div class="gyp-import-list" data-role="media-organize-list">
+                <div class="gyp-import-empty">勾选文件夹或文件后点“识别并预览”，这里会显示分类和目标目录。</div>
+              </div>
+            </div>
+          </details>
           <details class="gyp-section" data-role="direct-download-details">
             <summary>
               <span class="gyp-section-summary">
@@ -16009,6 +17859,9 @@
     UI.moveDetails = root.querySelector('[data-role="move-details"]');
     UI.moveSelectionList = root.querySelector('[data-role="move-selection-list"]');
     UI.moveSelectionCount = root.querySelector('[data-role="move-count"]');
+    UI.mediaOrganizeDetails = root.querySelector('[data-role="media-organize-details"]');
+    UI.mediaOrganizeList = root.querySelector('[data-role="media-organize-list"]');
+    UI.mediaOrganizeCount = root.querySelector('[data-role="media-organize-count"]');
     UI.directDownloadDetails = root.querySelector('[data-role="direct-download-details"]');
     UI.directDownloadList = root.querySelector('[data-role="direct-download-list"]');
     UI.directDownloadCount = root.querySelector('[data-role="direct-download-count"]');
@@ -16055,6 +17908,17 @@
     UI.fields.cloudBatchLimit = root.querySelector('[data-field="cloudBatchLimit"]');
     UI.fields.cloudDirPrefix = root.querySelector('[data-field="cloudDirPrefix"]');
     UI.fields.moveTargetParentId = root.querySelector('[data-field="moveTargetParentId"]');
+    UI.fields.mediaTmdbApiKey = root.querySelector('[data-field="mediaTmdbApiKey"]');
+    UI.fields.mediaRootParentId = root.querySelector('[data-field="mediaRootParentId"]');
+    UI.fields.mediaTmdbLanguage = root.querySelector('[data-field="mediaTmdbLanguage"]');
+    UI.fields.mediaUseFolderNameFirst = root.querySelector('[data-field="mediaUseFolderNameFirst"]');
+    UI.fields.mediaIncludeTitleFolder = root.querySelector('[data-field="mediaIncludeTitleFolder"]');
+    UI.fields.mediaIncludeRegionFolder = root.querySelector('[data-field="mediaIncludeRegionFolder"]');
+    UI.fields.mediaIncludeSeasonFolder = root.querySelector('[data-field="mediaIncludeSeasonFolder"]');
+    UI.fields.mediaMoveBySourceFolder = root.querySelector('[data-field="mediaMoveBySourceFolder"]');
+    UI.fields.mediaCleanupEmptySourceFolders = root.querySelector('[data-field="mediaCleanupEmptySourceFolders"]');
+    UI.fields.mediaSkipDuplicateTargets = root.querySelector('[data-field="mediaSkipDuplicateTargets"]');
+    UI.fields.mediaBatchSize = root.querySelector('[data-field="mediaBatchSize"]');
     UI.fields.directDownloadBatchSize = root.querySelector('[data-field="directDownloadBatchSize"]');
     UI.fields.directDownloadExportFormat = root.querySelector('[data-field="directDownloadExportFormat"]');
     UI.fields.shareLinkUrl = root.querySelector('[data-field="shareLinkUrl"]');
@@ -16085,6 +17949,7 @@
     }
     renderShareLinkList();
     renderDirectDownloadList();
+    renderMediaOrganizeList();
 
     const closePanel = () => {
       root.classList.remove('gyp-open');
@@ -16524,6 +18389,48 @@
           } else {
             updatePanelStatus(selection.meta?.warning || `已读取当前页面勾选 ${Math.max(items.length, Number(selection.meta?.expectedCount || 0))} 项`);
           }
+          return;
+        }
+
+        if (action === 'preview-media-organize') {
+          if (UI.mediaOrganizeDetails) {
+            UI.mediaOrganizeDetails.open = true;
+          }
+          await runWithTaskControl('媒体智能识别预览', async (taskControl) => {
+            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备读取勾选项并识别媒体...' });
+            const groups = await previewMediaOrganizeSelection({
+              onProgress: (state) => setProgressBar(state),
+              taskControl,
+            });
+            setProgressBar({ visible: true, percent: 100, indeterminate: false, text: `媒体识别完成：${groups.length} 组` });
+            updatePanelStatus(`媒体智能整理预览完成：${groups.length} 组；请核对目标目录后再执行整理`);
+          });
+          return;
+        }
+
+        if (action === 'run-media-organize') {
+          if (UI.mediaOrganizeDetails) {
+            UI.mediaOrganizeDetails.open = true;
+          }
+          await runWithTaskControl('媒体智能整理', async (taskControl) => {
+            setProgressBar({ visible: true, percent: 0, indeterminate: true, text: '准备按预览结果整理媒体...' });
+            const result = await executeMediaOrganizePlan({
+              onProgress: (state) => setProgressBar(state),
+              taskControl,
+            });
+            renderMediaOrganizeList();
+            const failureText = result.failures?.length ? `；首个失败：${result.failures[0]}` : '';
+            updatePanelStatus(`媒体智能整理完成：成功 ${result.ok} 项，失败 ${result.fail} 项${failureText}`);
+          });
+          return;
+        }
+
+        if (action === 'clear-media-organize') {
+          STATE.mediaOrganizePreviewItems = [];
+          STATE.mediaOrganizePlan = null;
+          STATE.mediaOrganizeWarning = '';
+          renderMediaOrganizeList();
+          updatePanelStatus('已清空媒体智能整理预览');
           return;
         }
 
