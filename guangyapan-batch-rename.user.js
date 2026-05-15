@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         光鸭云盘批量助手 V4
 // @namespace    serenalee.guangyapan.batch-helper
-// @version      0.5.85
+// @version      0.5.92
 // @description  为光鸭云盘网页端提供批量重命名、重复项清理、移动整理、磁力云添加、秒传 JSON 转换/诊断、空目录扫描与删除等功能。
 // @author       Serena Lee
 // @license      Copyright (c) 2026 Serena Lee. All rights reserved.
@@ -53,7 +53,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '0.5.85';
+  const SCRIPT_VERSION = '0.5.92';
 
   // =========================
   // 用户配置区：主要改这里
@@ -260,7 +260,10 @@
     mediaOrganizePreviewItems: [],
     mediaOrganizePlan: null,
     mediaOrganizeWarning: '',
+    mediaRecentCheckedItems: [],
     tmdbCache: {},
+    tmdbFailureCount: 0,
+    tmdbDisabledUntil: 0,
     directDownloadPreviewItems: [],
     directDownloadExpectedCount: 0,
     directDownloadWarning: '',
@@ -2369,7 +2372,9 @@
       truncated = true;
     }
 
-    const cachedItems = dedupeItems(getCapturedItemsByParentId(normalizedParentId));
+    const cachedItems = options.ignoreCapturedCache === true
+      ? []
+      : dedupeItems(getCapturedItemsByParentId(normalizedParentId));
     const mergedItems = cachedItems.length > allItems.length
       ? dedupeItems([...allItems, ...cachedItems])
       : allItems;
@@ -8902,6 +8907,25 @@
     if (!value) {
       return true;
     }
+    const compact = value.replace(/\s+/gu, '').toLowerCase();
+    if (/^(?:sort(?:triangle)?(?:asc|desc|ascending|descending)?|sorttriangle(?:asc|desc)?|triangle(?:asc|desc)|caret(?:up|down)|arrow(?:up|down)|sorter|sortascend|sortdescend)$/u.test(compact)) {
+      return true;
+    }
+    if (/(?:已选(?:择)?|已勾选)\s*\d+\s*(?:项|个\s*(?:文件(?:\s*[/／]\s*文件夹)?|文件夹|项目)?)/u.test(value)) {
+      return true;
+    }
+    if (/\d+\s*(?:项|个\s*(?:文件(?:\s*[/／]\s*文件夹)?|文件夹|项目)?)\s*(?:已选(?:择)?|已勾选)/u.test(value)) {
+      return true;
+    }
+    if (/^(?:已选(?:择)?|已勾选)\d+(?:项|个(?:文件(?:[/／]文件夹)?|文件夹|项目)?)$/u.test(compact)) {
+      return true;
+    }
+    if (/^\d+(?:项|个(?:文件(?:[/／]文件夹)?|文件夹|项目)?)(?:已选(?:择)?|已勾选)$/u.test(compact)) {
+      return true;
+    }
+    if (/^selected\d+(?:items?|files?(?:[/／]folders?)?)$/iu.test(compact) || /^\d+(?:items?|files?(?:[/／]folders?)?)selected$/iu.test(compact)) {
+      return true;
+    }
 
     return (
       /^(type(?:unknown|file|folder|video|audio|image|document|other|torrent)|filetypeunknown)$/i.test(value) ||
@@ -10155,6 +10179,654 @@
     }
 
     return out;
+  }
+
+  function rememberMediaRecentSelectionItem(item, checked = true) {
+    const name = String(item?.name || '').trim();
+    const normalizedName = normalizeDomName(name);
+    if (!normalizedName || !isProbablyUsefulName(name) || isProbablyMetadataText(name)) {
+      return;
+    }
+    const list = Array.isArray(STATE.mediaRecentCheckedItems) ? STATE.mediaRecentCheckedItems : [];
+    const next = list.filter((entry) => normalizeDomName(entry?.name || '') !== normalizedName);
+    if (checked) {
+      next.push({
+        fileId: String(item.fileId || `dom:recent:${normalizedName}`),
+        dirId: String(item.dirId || item.fileId || `dom:recent:${normalizedName}`),
+        dirIdCandidates: normalizeIdCandidates(item.dirIdCandidates || [item.dirId, item.fileId]),
+        name,
+        parentId: String(item.parentId || getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || ''),
+        isDir: item.isDir === true,
+        resolved: Boolean(item.resolved && item.fileId && !isSyntheticDomId(item.fileId)),
+        rememberedAt: Date.now(),
+      });
+    }
+    STATE.mediaRecentCheckedItems = next.slice(-80);
+  }
+
+  function rememberMediaSelectionFromDomEvent(event) {
+    const target = event?.target;
+    if (!target || isHelperPanelNode(target)) {
+      return;
+    }
+    const row = getClosestMediaSelectionRow(target);
+    if (!row || !isUsableListRow(row) || isHelperPanelNode(row)) {
+      return;
+    }
+    window.setTimeout(() => {
+      try {
+        const checkbox = getCheckboxInRow(row);
+        const checked = checkbox
+          ? isLikelyFastSelectedMediaControl(checkbox)
+          : (isLikelyFastSelectedMediaControl(target) || rowHasFastSelectionVisual(row));
+        const fromCheckbox = checkbox && (target === checkbox || checkbox.contains?.(target) || isCheckboxLikeNode(target));
+        const rowSelected = nodeHasSelectedStateHint(row) || rowHasFastSelectionVisual(row);
+        if (!checked && !fromCheckbox && !rowSelected) {
+          return;
+        }
+        const name = extractNameFromRow(row);
+        if (!isProbablyUsefulName(name) || isProbablyMetadataText(name)) {
+          return;
+        }
+        rememberMediaRecentSelectionItem({
+          fileId: `dom:recent:${name}`,
+          dirId: `dom:recent:${name}`,
+          dirIdCandidates: [`dom:recent:${name}`],
+          name,
+          isDir: guessDomRowIsDirectory(row, name),
+          parentId: getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '',
+        }, checked || rowSelected);
+      } catch (err) {
+        warn('记录媒体整理勾选状态失败：', err);
+      }
+    }, 0);
+  }
+
+  function installMediaSelectionTracker() {
+    if (STATE.mediaSelectionTrackerInstalled) {
+      return;
+    }
+    STATE.mediaSelectionTrackerInstalled = true;
+    document.addEventListener('click', rememberMediaSelectionFromDomEvent, true);
+    document.addEventListener('change', rememberMediaSelectionFromDomEvent, true);
+  }
+
+  function resolveFastMediaCheckedItems(items = []) {
+    const normalizedItems = (Array.isArray(items) ? items : [])
+      .filter((item) => item && String(item.name || '').trim())
+      .map((item) => ({
+        ...item,
+        fileId: String(item.fileId || `dom:fast:${item.name}`),
+        dirId: String(item.dirId || item.fileId || `dom:fast:${item.name}`),
+        dirIdCandidates: normalizeIdCandidates(item.dirIdCandidates || [item.dirId, item.fileId]),
+        parentId: String(item.parentId || getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || ''),
+      }));
+    if (!normalizedItems.length) {
+      return {
+        items: [],
+        unresolved: [],
+        source: 'fast-empty',
+      };
+    }
+    const currentParentId = String(getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '').trim();
+    const sources = [
+      { source: 'captured-current-parent', items: currentParentId ? getCapturedItemsByParentId(currentParentId) : [] },
+      { source: 'captured', items: getCapturedItems() },
+      { source: 'fast-dom', items: normalizedItems.filter((item) => item.fileId && !isSyntheticDomId(item.fileId)) },
+    ].filter((entry) => Array.isArray(entry.items) && entry.items.length);
+
+    for (const entry of sources) {
+      const mapping = resolveCheckedMoveItemsByName(normalizedItems, entry.items);
+      if (!mapping.unresolved.length) {
+        return {
+          items: mapping.resolved,
+          unresolved: [],
+          source: entry.source,
+        };
+      }
+    }
+
+    const best = sources.length
+      ? resolveCheckedMoveItemsByName(normalizedItems, sources[0].items)
+      : {
+          resolved: normalizedItems.filter((item) => item.fileId && !isSyntheticDomId(item.fileId)),
+          unresolved: normalizedItems.filter((item) => !item.fileId || isSyntheticDomId(item.fileId)),
+        };
+    return {
+      items: best.resolved || [],
+      unresolved: best.unresolved || [],
+      source: sources[0]?.source || 'fast-dom',
+    };
+  }
+
+  function getElementClassName(node) {
+    const className = node?.className;
+    if (typeof className === 'string') {
+      return className;
+    }
+    if (className && typeof className.baseVal === 'string') {
+      return className.baseVal;
+    }
+    return String(node?.getAttribute?.('class') || '');
+  }
+
+  function nodeHasSelectionControlHint(node) {
+    if (!node) {
+      return false;
+    }
+    const values = [
+      getElementClassName(node),
+      node.getAttribute?.('aria-label'),
+      node.getAttribute?.('title'),
+      node.getAttribute?.('data-testid'),
+      node.getAttribute?.('data-test-id'),
+      node.getAttribute?.('role'),
+    ].map((value) => String(value || '').toLowerCase()).join(' ');
+    return /(checkbox|check|select|selection|checked|selected|选择|勾选)/iu.test(values);
+  }
+
+  function nodeOrAncestorHasSelectionControlHint(node, stopAt = null) {
+    let current = node;
+    for (let depth = 0; current && current !== document.body && depth < 5; depth += 1) {
+      if (nodeHasSelectionControlHint(current)) {
+        return true;
+      }
+      if (current === stopAt) {
+        break;
+      }
+      current = current.parentElement;
+    }
+    return false;
+  }
+
+  function nodeHasSelectedStateHint(node) {
+    if (!node) {
+      return false;
+    }
+    const attrs = [
+      node.getAttribute?.('aria-selected'),
+      node.getAttribute?.('aria-checked'),
+      node.getAttribute?.('data-selected'),
+      node.getAttribute?.('data-checked'),
+      node.getAttribute?.('data-state'),
+      node.getAttribute?.('checked'),
+    ].map((value) => String(value || '').toLowerCase()).filter(Boolean);
+    if (attrs.some((value) => ['true', 'checked', 'selected', 'on'].includes(value))) {
+      return true;
+    }
+    if (attrs.some((value) => ['false', 'unchecked', 'unselected', 'off'].includes(value))) {
+      return false;
+    }
+    const className = getElementClassName(node).toLowerCase();
+    if (/(^|[\s:_-])(un|not)-?(checked|selected)([\s:_-]|$)/u.test(className)) {
+      return false;
+    }
+    return /(^|[\s:_-])(?:is-)?(?:checked|selected)([\s:_-]|$)/u.test(className)
+      || /(^|[\s:_-])\w+-(?:checked|selected)([\s:_-]|$)/u.test(className);
+  }
+
+  function parseCssColor(value) {
+    const text = String(value || '').trim();
+    if (!text || text === 'none' || text === 'transparent') {
+      return null;
+    }
+    let match = text.match(/^rgba?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)(?:\s*,\s*(\d?(?:\.\d+)?))?\s*\)$/iu);
+    if (match) {
+      const alpha = match[4] == null ? 1 : Number(match[4]);
+      if (!Number.isFinite(alpha) || alpha <= 0.05) {
+        return null;
+      }
+      return {
+        r: Number(match[1]),
+        g: Number(match[2]),
+        b: Number(match[3]),
+      };
+    }
+    match = text.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/iu);
+    if (!match) {
+      return null;
+    }
+    const hex = match[1].length === 3
+      ? match[1].split('').map((ch) => `${ch}${ch}`).join('')
+      : match[1];
+    return {
+      r: parseInt(hex.slice(0, 2), 16),
+      g: parseInt(hex.slice(2, 4), 16),
+      b: parseInt(hex.slice(4, 6), 16),
+    };
+  }
+
+  function isOrangeSelectionColor(value) {
+    const color = parseCssColor(value);
+    if (!color) {
+      return false;
+    }
+    return color.r >= 180
+      && color.g >= 55
+      && color.g <= 190
+      && color.b <= 120
+      && color.r - color.g >= 18
+      && color.g - color.b >= 10;
+  }
+
+  function elementHasOrangeSelectionVisual(node) {
+    if (!node || !isVisibleElement(node)) {
+      return false;
+    }
+    const nodes = dedupeElements([
+      node,
+      ...Array.from(node.querySelectorAll?.('svg, path, use, span, i, button') || []).slice(0, 10),
+    ]);
+    for (const item of nodes) {
+      const style = window.getComputedStyle ? window.getComputedStyle(item) : null;
+      const values = [
+        style?.backgroundColor,
+        style?.borderTopColor,
+        style?.color,
+        style?.fill,
+        style?.stroke,
+        item.getAttribute?.('fill'),
+        item.getAttribute?.('stroke'),
+      ];
+      if (values.some(isOrangeSelectionColor)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function isLikelyFastSelectedMediaControl(node) {
+    if (!node || isHelperPanelNode(node) || !isVisibleElement(node)) {
+      return false;
+    }
+    if (isElementChecked(node) || nodeHasSelectedStateHint(node)) {
+      return true;
+    }
+    return nodeHasSelectionControlHint(node) && elementHasOrangeSelectionVisual(node);
+  }
+
+  function isElementInRowLeftSelectionZone(node, row) {
+    if (!node || !row || typeof node.getBoundingClientRect !== 'function' || typeof row.getBoundingClientRect !== 'function') {
+      return false;
+    }
+    const nodeRect = node.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    if (!nodeRect || !rowRect || nodeRect.width < 6 || nodeRect.height < 6 || nodeRect.width > 38 || nodeRect.height > 38) {
+      return false;
+    }
+    const centerX = nodeRect.left + (nodeRect.width / 2);
+    const centerY = nodeRect.top + (nodeRect.height / 2);
+    const ratio = nodeRect.width / Math.max(1, nodeRect.height);
+    return centerX >= rowRect.left - 8
+      && centerX <= rowRect.left + 64
+      && centerY >= rowRect.top
+      && centerY <= rowRect.bottom
+      && ratio >= 0.45
+      && ratio <= 2.2;
+  }
+
+  function isLikelyFastSelectedMediaControlInRow(node, row) {
+    if (!node || !row || isHelperPanelNode(node) || !isVisibleElement(node)) {
+      return false;
+    }
+    if (isElementChecked(node) || nodeHasSelectedStateHint(node)) {
+      return true;
+    }
+    if (nodeOrAncestorHasSelectionControlHint(node, row) && elementHasOrangeSelectionVisual(node)) {
+      return true;
+    }
+    return isElementInRowLeftSelectionZone(node, row)
+      && elementHasOrangeSelectionVisual(node)
+      && nodeOrAncestorHasSelectionControlHint(node, row);
+  }
+
+  function rowHasFastSelectionVisual(row) {
+    if (!row || !isVisibleElement(row) || isHelperPanelNode(row)) {
+      return false;
+    }
+    if (nodeHasSelectedStateHint(row)) {
+      return true;
+    }
+    const selectors = [
+      'input[type="checkbox"]',
+      '[role="checkbox"]',
+      '[aria-label*="选择"]',
+      '[title*="选择"]',
+      'button',
+      '[class*="checkbox"]',
+      '[class*="check"]',
+      '[class*="selection"]',
+      '[class*="select"]',
+      'svg',
+      'path',
+      'span',
+      'i',
+    ];
+    const nodes = dedupeElements(Array.from(row.querySelectorAll?.(selectors.join(',')) || [])).slice(0, 90);
+    return nodes.some((node) => isLikelyFastSelectedMediaControlInRow(node, row));
+  }
+
+  function collectFastMediaSelectionControlCandidates(options = {}) {
+    const pageSelectedCount = Math.max(0, Number(options.pageSelectedCount || 0));
+    const limit = Math.max(20, Math.min(180, Number(options.limit || Math.max(80, pageSelectedCount * 4 || 80))));
+    const selectors = [
+      'input[type="checkbox"]:checked',
+      '[role="checkbox"][aria-checked="true"]',
+      '[aria-selected="true"]',
+      '[data-state="checked"]',
+      '[data-selected="true"]',
+      '[data-checked="true"]',
+      '.ant-checkbox-checked',
+      '.ant-checkbox-wrapper-checked',
+      '.ant-table-row-selected',
+      '.is-selected',
+      '.selected',
+      '[class*="checkbox"][class*="checked"]',
+      '[class*="check"][class*="checked"]',
+      '[class*="selected"]',
+    ];
+    const softSelectors = pageSelectedCount > 0 ? [
+      'button[aria-label*="选择"]',
+      '[aria-label*="选择"]',
+      '[title*="选择"]',
+      '[role="checkbox"]',
+      '[class*="checkbox"]',
+      '[class*="check"]',
+      '[class*="selection"]',
+      '[class*="select"]',
+      'input[type="checkbox"]',
+    ] : [];
+    const nodes = [];
+    const addSelectorMatches = (selector) => {
+      if (nodes.length >= limit * 3) {
+        return;
+      }
+      try {
+        nodes.push(...Array.from(document.querySelectorAll(selector)).slice(0, limit * 3 - nodes.length));
+      } catch {}
+    };
+    selectors.forEach(addSelectorMatches);
+    softSelectors.forEach(addSelectorMatches);
+    return dedupeElements(nodes)
+      .filter((node) => isLikelyFastSelectedMediaControl(node))
+      .slice(0, limit);
+  }
+
+  function scoreFastMediaRowCandidate(row, control, bias = 0) {
+    if (!row || !isVisibleElement(row) || isHelperPanelNode(row) || isBreadcrumbContainerNode(row) || isLikelyListHeaderRow(row)) {
+      return Number.NEGATIVE_INFINITY;
+    }
+    const rect = row.getBoundingClientRect?.();
+    if (!rect || rect.width < 180 || rect.height < 20 || rect.height > Math.min(window.innerHeight || 900, 280)) {
+      return Number.NEGATIVE_INFINITY;
+    }
+    const text = normalizeDomName(row.innerText || row.textContent || '');
+    if (!text || text.length > 900) {
+      return Number.NEGATIVE_INFINITY;
+    }
+    const name = extractNameFromRow(row);
+    if (!isProbablyUsefulName(name) || isProbablyMetadataText(name)) {
+      return Number.NEGATIVE_INFINITY;
+    }
+    let score = bias + Math.min(70, normalizeDomName(name).length);
+    if (row.matches?.(getRowSelector())) {
+      score += 45;
+    }
+    if (nodeHasSelectedStateHint(row)) {
+      score += 35;
+    }
+    if (control && row.contains?.(control)) {
+      score += 30;
+    }
+    if (rect.height >= 28 && rect.height <= 120) {
+      score += 24;
+    }
+    const checkbox = control && row.contains?.(control) ? getCheckboxInRow(row) : null;
+    if (checkbox && isLikelyFastSelectedMediaControl(checkbox)) {
+      score += 24;
+    }
+    return score;
+  }
+
+  function collectFastVisibleMediaRows(limit = 160) {
+    const selectors = [
+      '[role="row"]',
+      'tr',
+      'li',
+      '[data-row-key]',
+      '[data-id]',
+      '[class*="row"]',
+      '[class*="file"]',
+      '[class*="entry"]',
+      '[class*="list-item"]',
+    ];
+    const rows = [];
+    for (const selector of selectors) {
+      if (rows.length >= limit * 2) {
+        break;
+      }
+      try {
+        rows.push(...Array.from(document.querySelectorAll(selector)).slice(0, limit * 2 - rows.length));
+      } catch {}
+    }
+    return dedupeElements(rows)
+      .filter((row) => scoreFastMediaRowCandidate(row, null, 0) > Number.NEGATIVE_INFINITY)
+      .slice(0, limit);
+  }
+
+  function findMediaRowByControlPosition(control) {
+    if (!control || typeof control.getBoundingClientRect !== 'function') {
+      return null;
+    }
+    const controlRect = control.getBoundingClientRect();
+    if (!controlRect || !Number.isFinite(controlRect.top)) {
+      return null;
+    }
+    const controlCenterY = controlRect.top + (controlRect.height / 2);
+    const rows = collectFastVisibleMediaRows(160);
+    let best = null;
+    for (const row of rows) {
+      const rect = row.getBoundingClientRect();
+      const verticalGap = controlCenterY < rect.top
+        ? rect.top - controlCenterY
+        : controlCenterY > rect.bottom
+          ? controlCenterY - rect.bottom
+          : 0;
+      if (verticalGap > 18) {
+        continue;
+      }
+      if (controlRect.left > rect.right || controlRect.right < rect.left - 80) {
+        continue;
+      }
+      const score = scoreFastMediaRowCandidate(row, control, 30) - verticalGap;
+      if (!best || score > best.score) {
+        best = { row, score };
+      }
+    }
+    return best?.row || null;
+  }
+
+  function getClosestMediaSelectionRow(node) {
+    if (!node) {
+      return null;
+    }
+    const direct = getClosestRow(node);
+    if (direct && isUsableListRow(direct)) {
+      return direct;
+    }
+    const candidates = [];
+    const addCandidate = (row, bias = 0) => {
+      const score = scoreFastMediaRowCandidate(row, node, bias);
+      if (score > Number.NEGATIVE_INFINITY) {
+        candidates.push({ row, score });
+      }
+    };
+    addCandidate(direct, 40);
+    let current = node.parentElement;
+    for (let depth = 0; current && current !== document.body && depth < 9; depth += 1) {
+      addCandidate(current, 32 - depth * 2);
+      addCandidate(current.previousElementSibling, 4);
+      addCandidate(current.nextElementSibling, 4);
+      current = current.parentElement;
+    }
+    candidates.sort((left, right) => right.score - left.score);
+    return candidates[0]?.row || findMediaRowByControlPosition(node);
+  }
+
+  function collectFastVisibleSelectedMediaRows(pageSelectedCount = 0) {
+    const limit = Math.max(80, Math.min(220, Number(pageSelectedCount || 0) * 8 || 120));
+    return collectFastVisibleMediaRows(limit)
+      .filter((row) => rowHasFastSelectionVisual(row));
+  }
+
+  function collectFastVisibleCheckedMediaItems() {
+    const pageSelectedCount = getPageSelectedCount();
+    const controls = collectFastMediaSelectionControlCandidates({ pageSelectedCount });
+    const rows = dedupeElements([
+      ...controls.map((node) => getClosestMediaSelectionRow(node) || (isUsableListRow(node) ? node : null)),
+      ...collectFastVisibleSelectedMediaRows(pageSelectedCount),
+    ].filter(Boolean));
+    const seen = new Set();
+    const out = [];
+    for (const row of rows) {
+      if (!row || !isUsableListRow(row) || isHelperPanelNode(row)) {
+        continue;
+      }
+      const name = extractNameFromRow(row);
+      const normalizedName = normalizeDomName(name);
+      if (!normalizedName || seen.has(normalizedName) || !isProbablyUsefulName(name) || isProbablyMetadataText(name)) {
+        continue;
+      }
+      seen.add(normalizedName);
+      out.push({
+        fileId: `dom:fast:${name}`,
+        dirId: `dom:fast:${name}`,
+        dirIdCandidates: [`dom:fast:${name}`],
+        name,
+        parentId: getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '',
+        isDir: guessDomRowIsDirectory(row, name),
+        row,
+        resolved: false,
+      });
+    }
+    return out;
+  }
+
+  function debugMediaSelection() {
+    const pageSelectedCount = getPageSelectedCount();
+    const controls = collectFastMediaSelectionControlCandidates({ pageSelectedCount, limit: 40 });
+    const fastItems = collectFastVisibleCheckedMediaItems();
+    const recentItems = (Array.isArray(STATE.mediaRecentCheckedItems) ? STATE.mediaRecentCheckedItems : []).slice(-10);
+    return {
+      pageSelectedCount,
+      fastItemCount: fastItems.length,
+      fastItems: fastItems.map((item) => ({
+        name: item.name,
+        isDir: item.isDir,
+        parentId: item.parentId,
+        resolved: item.resolved,
+      })),
+      recentItems: recentItems.map((item) => ({
+        name: item.name,
+        isDir: item.isDir,
+        parentId: item.parentId,
+        rememberedAt: item.rememberedAt,
+      })),
+      controlCount: controls.length,
+      controls: controls.slice(0, 12).map((node) => {
+        const row = getClosestMediaSelectionRow(node);
+        return {
+          tag: String(node.tagName || '').toLowerCase(),
+          className: getElementClassName(node).slice(0, 160),
+          ariaChecked: node.getAttribute?.('aria-checked') || '',
+          ariaSelected: node.getAttribute?.('aria-selected') || '',
+          dataState: node.getAttribute?.('data-state') || '',
+          text: normalizeDomName(node.textContent || '').slice(0, 80),
+          rowName: row ? extractNameFromRow(row) : '',
+          rowClassName: row ? getElementClassName(row).slice(0, 160) : '',
+        };
+      }),
+    };
+  }
+
+  async function collectMediaOrganizeCheckedItemsFast(options = {}) {
+    const currentParentId = String(getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '').trim();
+    const recentCutoff = Date.now() - 10 * 60 * 1000;
+    const recentItems = (Array.isArray(STATE.mediaRecentCheckedItems) ? STATE.mediaRecentCheckedItems : [])
+      .filter((item) => Number(item.rememberedAt || 0) >= recentCutoff)
+      .filter((item) => isProbablyUsefulName(item?.name || '') && !isProbablyMetadataText(item?.name || ''))
+      .filter((item) => !currentParentId || !String(item.parentId || '').trim() || String(item.parentId || '') === currentParentId);
+    const visibleItems = collectFastVisibleCheckedMediaItems();
+    const byName = new Map();
+    for (const item of [...recentItems, ...visibleItems]) {
+      const key = normalizeDomName(item?.name || '');
+      if (!key || !isProbablyUsefulName(item?.name || '') || isProbablyMetadataText(item?.name || '')) {
+        continue;
+      }
+      if (!byName.has(key)) {
+        byName.set(key, item);
+      }
+    }
+    const candidates = Array.from(byName.values());
+    const resolved = resolveFastMediaCheckedItems(candidates);
+    const pageSelectedCount = Math.max(0, Number(getPageSelectedCount() || 0));
+    if (resolved.unresolved.length && pageSelectedCount > 0 && resolved.items.length >= pageSelectedCount) {
+      const limitedItems = resolved.items.slice(0, pageSelectedCount);
+      if (options.onProgress) {
+        options.onProgress({
+          visible: true,
+          percent: 6,
+          indeterminate: true,
+          text: `已按页面已选数量读取媒体整理勾选项 ${limitedItems.length} 项`,
+        });
+      }
+      return {
+        items: limitedItems,
+        meta: {
+          expectedCount: pageSelectedCount,
+          visibleCount: limitedItems.length,
+          partial: false,
+          source: resolved.source || 'media-fast-selected-count',
+          warning: `已忽略 ${resolved.unresolved.length} 个页面状态/控件噪声候选。`,
+        },
+      };
+    }
+    if (!resolved.items.length && resolved.unresolved.length) {
+      throw new Error(`当前已识别到勾选项，但没有拿到真实 fileId。请刷新页面等待列表加载完成后重新勾选。示例：${resolved.unresolved.slice(0, 3).map((item) => item.name).join('、')}`);
+    }
+    if (resolved.unresolved.length && resolved.items.length < candidates.length) {
+      throw new Error(`当前已识别到 ${candidates.length} 个勾选项，但只有 ${resolved.items.length} 个拿到真实 fileId，已停止生成不完整预览。请刷新页面后重新勾选；若仍复现，请在控制台运行 gypBatchRenamer.debugMediaSelection() 发我结果。示例未解析：${resolved.unresolved.slice(0, 3).map((item) => item.name).join('、')}`);
+    }
+    if (!resolved.items.length) {
+      return {
+        items: [],
+        meta: {
+          expectedCount: 0,
+          visibleCount: 0,
+          partial: false,
+          source: 'media-fast-empty',
+          warning: '',
+        },
+      };
+    }
+    if (options.onProgress) {
+      options.onProgress({
+        visible: true,
+        percent: 6,
+        indeterminate: true,
+        text: `已快速读取媒体整理勾选项 ${resolved.items.length} 项`,
+      });
+    }
+    return {
+      items: resolved.items,
+      meta: {
+        expectedCount: resolved.items.length,
+        visibleCount: resolved.items.length,
+        partial: false,
+        source: resolved.source || 'media-fast',
+        warning: '',
+      },
+    };
   }
 
   function collectCheckedListRowEntries() {
@@ -12349,15 +13021,15 @@
           onProgress,
           taskControl,
           expectedTotal: batch.length,
-          maxTries: batchSourceItems.length ? Math.min(Math.max(CONFIG.batch.taskPollMaxTries || 12, 12), 24) : Math.max(CONFIG.batch.taskPollMaxTries || 180, 180),
-          intervalMs: Math.max(CONFIG.batch.taskPollMs || 1500, 1500),
+          maxTries: Math.max(1, Number(options.taskPollMaxTries || (batchSourceItems.length ? Math.min(Math.max(CONFIG.batch.taskPollMaxTries || 12, 12), 24) : Math.max(CONFIG.batch.taskPollMaxTries || 180, 180)))),
+          intervalMs: Math.max(Number(options.taskPollMs || 0), CONFIG.batch.taskPollMs || 1500, 800),
         });
         if (batchSourceItems.length && (!task.ok || !hasUsefulTaskState(task.result?.payload, batch.length))) {
           const verification = await verifyMovedItemsByList(batchSourceItems, {
             onProgress,
             taskControl,
-            maxRounds: 6,
-            intervalMs: Math.max(CONFIG.batch.taskPollMs || 1500, 1500),
+            maxRounds: Math.max(1, Number(options.verifyMaxRounds || 6)),
+            intervalMs: Math.max(Number(options.taskPollMs || 0), CONFIG.batch.taskPollMs || 1500, 800),
           });
           if (verification.movedItems.length) {
             summary.ok += verification.movedItems.length;
@@ -12417,8 +13089,40 @@
           summary.movedFileIds.push(...batch);
         }
       } catch (err) {
+        const errorText = getErrorText(err);
+        if (allowSplitRetry && batch.length > 1) {
+          const nextBatchSize = batch.length > 20 ? 20 : 1;
+          if (onProgress) {
+            onProgress({
+              visible: true,
+              percent: Math.max(15, Math.round((index / Math.max(1, batches.length)) * 100)),
+              indeterminate: true,
+              text: `${label}：整批提交失败，正在按更小批次重试（${batch.length} -> ${nextBatchSize}）`,
+            });
+          }
+          const retried = await moveFilesInBatches(batch, parentId, {
+            onProgress,
+            taskControl,
+            label: `${label}小批重试`,
+            batchSize: nextBatchSize,
+            verifySourceItems: batchSourceItems,
+            allowSplitRetry: nextBatchSize > 1,
+            taskPollMaxTries: options.taskPollMaxTries,
+            verifyMaxRounds: options.verifyMaxRounds,
+            taskPollMs: options.taskPollMs,
+          });
+          summary.ok += retried.ok;
+          summary.fail += retried.fail;
+          summary.submittedBatches += retried.submittedBatches;
+          summary.taskIds.push(...(retried.taskIds || []));
+          summary.movedFileIds.push(...(retried.movedFileIds || []));
+          if (!summary.firstError && retried.firstError) {
+            summary.firstError = retried.firstError;
+          }
+          continue;
+        }
         summary.fail += batch.length;
-        summary.firstError = summary.firstError || getErrorText(err);
+        summary.firstError = summary.firstError || errorText;
         warn(`${label}失败：`, err);
         if (CONFIG.batch.stopOnError) {
           break;
@@ -12583,6 +13287,9 @@
   }
 
   const MEDIA_TMDB_HOST = 'api.themoviedb.org';
+  const MEDIA_TMDB_TIMEOUT_MS = 8000;
+  const MEDIA_TMDB_FAILURE_LIMIT = 2;
+  const MEDIA_TMDB_COOLDOWN_MS = 120000;
   const MEDIA_GENRE = Object.freeze({
     animation: 16,
     documentary: 99,
@@ -13018,6 +13725,23 @@
     return groups;
   }
 
+  function isTmdbTemporarilyDisabled() {
+    return Number(STATE.tmdbDisabledUntil || 0) > Date.now();
+  }
+
+  function recordTmdbSuccess() {
+    STATE.tmdbFailureCount = 0;
+    STATE.tmdbDisabledUntil = 0;
+  }
+
+  function recordTmdbFailure(err) {
+    STATE.tmdbFailureCount = Math.max(0, Number(STATE.tmdbFailureCount || 0)) + 1;
+    if (STATE.tmdbFailureCount >= MEDIA_TMDB_FAILURE_LIMIT) {
+      STATE.tmdbDisabledUntil = Date.now() + MEDIA_TMDB_COOLDOWN_MS;
+      warn(`TMDB 连续失败，${Math.round(MEDIA_TMDB_COOLDOWN_MS / 1000)} 秒内媒体智能整理改用本地规则：`, err);
+    }
+  }
+
   function tmdbGet(url) {
     return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest !== 'function') {
@@ -13027,7 +13751,7 @@
       GM_xmlhttpRequest({
         method: 'GET',
         url,
-        timeout: 30000,
+        timeout: MEDIA_TMDB_TIMEOUT_MS,
         onload: (res) => {
           if (res.status < 200 || res.status >= 300) {
             reject(new Error(`TMDB HTTP ${res.status}`));
@@ -13040,7 +13764,7 @@
           }
         },
         onerror: (err) => reject(new Error(`TMDB 网络错误：${getErrorText(err) || '未知错误'}`)),
-        ontimeout: () => reject(new Error('TMDB 请求超时')),
+        ontimeout: () => reject(new Error(`TMDB 请求超时（${Math.round(MEDIA_TMDB_TIMEOUT_MS / 1000)} 秒）`)),
       });
     });
   }
@@ -13054,9 +13778,15 @@
     if (STATE.tmdbCache[key]) {
       return STATE.tmdbCache[key];
     }
-    const data = await tmdbGet(url);
-    STATE.tmdbCache[key] = data;
-    return data;
+    try {
+      const data = await tmdbGet(url);
+      STATE.tmdbCache[key] = data;
+      recordTmdbSuccess();
+      return data;
+    } catch (err) {
+      recordTmdbFailure(err);
+      throw err;
+    }
   }
 
   function getMediaTmdbKey() {
@@ -13067,6 +13797,9 @@
     const apiKey = getMediaTmdbKey();
     if (!apiKey) {
       return null;
+    }
+    if (isTmdbTemporarilyDisabled()) {
+      throw new Error('TMDB 最近连续超时或失败，本轮临时改用本地规则');
     }
     const title = String(info?.title || '').trim();
     if (!title) {
@@ -13615,6 +14348,65 @@
     return segments.map((segment) => sanitizeCloudDirName(segment, '未识别')).filter(Boolean);
   }
 
+  async function fetchMediaDirectoryItemsCached(parentId, options = {}) {
+    const normalizedParentId = String(parentId || '').trim();
+    if (!normalizedParentId) {
+      return {
+        items: [],
+        pageCount: 0,
+        truncated: false,
+        cachedCount: 0,
+        fetchedCount: 0,
+      };
+    }
+    const pageSize = Math.max(1, Number(options.pageSize || CONFIG.request.manualListBody.pageSize || 100));
+    const maxPages = Math.max(1, Number(options.maxPages || 20));
+    const cache = options.directoryCache || null;
+    const forceRefresh = options.forceRefresh === true;
+    const ignoreCapturedCache = options.ignoreCapturedCache === true;
+    const candidates = normalizeIdCandidates([
+      ...(Array.isArray(options.idCandidates) ? options.idCandidates : []),
+      normalizedParentId,
+    ]);
+    for (const candidate of candidates) {
+      if (!forceRefresh && cache && cache.has(candidate)) {
+        const cached = cache.get(candidate);
+        if (cached && (!cached.truncated || Number(cached.maxPages || 0) >= maxPages)) {
+          return cached;
+        }
+      }
+    }
+    const listing = options.idCandidates
+      ? await fetchDirectoryItems(normalizedParentId, {
+          idCandidates: candidates,
+          pageSize,
+          maxPages,
+          delayMs: 0,
+          ignoreCapturedCache,
+          taskControl: options.taskControl || null,
+        })
+      : await fetchDirectoryItemsByParentId(normalizedParentId, {
+          pageSize,
+          maxPages,
+          delayMs: 0,
+          ignoreCapturedCache,
+          taskControl: options.taskControl || null,
+        });
+    const normalizedListing = {
+      ...listing,
+      maxPages,
+      pageSize,
+      cachedAt: Date.now(),
+    };
+    if (cache) {
+      cache.set(normalizedParentId, normalizedListing);
+      if (listing.usedParentId) {
+        cache.set(String(listing.usedParentId || ''), normalizedListing);
+      }
+    }
+    return normalizedListing;
+  }
+
   async function resolveMediaGroupMoveItems(group, options = {}) {
     if (!group?.needsChildListing || group.moveAsFolder) {
       return group;
@@ -13631,11 +14423,14 @@
         needsChildListing: false,
       };
     }
-    const listing = await fetchDirectoryItems(folderId, {
+    const listing = await fetchMediaDirectoryItemsCached(folderId, {
       idCandidates: normalizeIdCandidates([folderId, group.sourceItem?.dirId, ...(group.sourceItem?.dirIdCandidates || [])]),
       taskControl,
       pageSize: Math.max(100, Number(CONFIG.request.manualListBody.pageSize || 100)),
       maxPages: 50,
+      forceRefresh: options.forceRefresh === true,
+      ignoreCapturedCache: options.ignoreCapturedCache === true,
+      directoryCache: options.directoryCache || null,
     });
     const childItems = (listing.items || []).filter((item) => item && getMediaItemIdentity(item));
     const childDirs = childItems.filter((item) => shouldTreatItemAsDirectory(item));
@@ -13649,11 +14444,14 @@
     ) {
       const wrapperId = String(singleWrapperDir.fileId || singleWrapperDir.dirId || '').trim();
       if (wrapperId) {
-        const wrapperListing = await fetchDirectoryItems(wrapperId, {
+        const wrapperListing = await fetchMediaDirectoryItemsCached(wrapperId, {
           idCandidates: normalizeIdCandidates([wrapperId, singleWrapperDir.dirId, ...(singleWrapperDir.dirIdCandidates || [])]),
           taskControl,
           pageSize: Math.max(100, Number(CONFIG.request.manualListBody.pageSize || 100)),
           maxPages: 50,
+          forceRefresh: options.forceRefresh === true,
+          ignoreCapturedCache: options.ignoreCapturedCache === true,
+          directoryCache: options.directoryCache || null,
         });
         const wrapperItems = (wrapperListing.items || []).filter((item) => item && getMediaItemIdentity(item));
         if (wrapperItems.length) {
@@ -13852,6 +14650,9 @@
         throw new Error(`创建目录成功但未确认目录 ID：${dirName}`);
       }
       cache.set(cacheKey, dirId);
+      if (options.directoryCache) {
+        options.directoryCache.delete(String(parentId || ''));
+      }
       parentId = dirId;
     }
     return parentId;
@@ -13886,11 +14687,11 @@
       return cached;
     }
     try {
-      const listing = await fetchDirectoryItemsByParentId(parentId, {
+      const listing = await fetchMediaDirectoryItemsCached(parentId, {
         pageSize: Math.max(100, Number(CONFIG.request.manualListBody.pageSize || 100)),
         maxPages: 10,
-        delayMs: 0,
         taskControl: options.taskControl || null,
+        directoryCache: options.directoryCache || null,
       });
       const matched = (listing.items || []).find((item) => {
         if (!item || !shouldTreatItemAsDirectory(item)) {
@@ -13910,11 +14711,11 @@
     if (!parentId) {
       return [];
     }
-    const listing = await fetchDirectoryItemsByParentId(parentId, {
+    const listing = await fetchMediaDirectoryItemsCached(parentId, {
       pageSize: Math.max(100, Number(CONFIG.request.manualListBody.pageSize || 100)),
       maxPages: 20,
-      delayMs: 0,
       taskControl: options.taskControl || null,
+      directoryCache: options.directoryCache || null,
     });
     return listing.items || [];
   }
@@ -13962,7 +14763,10 @@
       const folder = candidates[index];
       const folderId = String(folder.fileId || folder.dirId || '').trim();
       try {
-        const children = await listMediaDirectoryChildren(folderId, { taskControl });
+        const children = await listMediaDirectoryChildren(folderId, {
+          taskControl,
+          directoryCache: options.directoryCache || null,
+        });
         if (children.length) {
           result.skipped += 1;
           continue;
@@ -14036,17 +14840,15 @@
   async function previewMediaOrganizeSelection(options = {}) {
     const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
     const taskControl = options.taskControl || null;
-    const selection = await collectResolvedCheckedMoveItems({
-      onlyDirectories: false,
+    const startedAt = Date.now();
+    const directoryCache = options.directoryCache || new Map();
+    const selection = await collectMediaOrganizeCheckedItemsFast({
       onProgress,
       taskControl,
-      includeMeta: true,
-      allowPartialVisible: true,
-      partialUsageLabel: '智能整理预览',
     });
     const checkedItems = selection.items || [];
     if (!checkedItems.length) {
-      throw new Error('当前页面没有勾选任何可整理的文件或文件夹。');
+      throw new Error('当前页面没有快速识别到勾选项。请先点击文件夹左侧勾选框；如果已勾选，请取消后重新勾选一次再点“识别并预览”。');
     }
     const groups = buildMediaSourceGroups(checkedItems);
     const analyzed = [];
@@ -14060,13 +14862,13 @@
           text: `正在识别媒体 ${index + 1}/${groups.length}：${shortDisplayName(groups[index].sourceName, 34)}`,
         });
       }
-      const resolvedGroup = await resolveMediaGroupMoveItems(groups[index], { taskControl });
+      const resolvedGroup = await resolveMediaGroupMoveItems(groups[index], { taskControl, directoryCache });
       const analyzeTargets = Array.isArray(resolvedGroup.seasonFolderGroups) && resolvedGroup.seasonFolderGroups.length
         ? resolvedGroup.seasonFolderGroups
         : [resolvedGroup];
       for (const targetGroup of analyzeTargets) {
         const finalGroup = targetGroup.needsChildListing
-          ? await resolveMediaGroupMoveItems(targetGroup, { taskControl })
+          ? await resolveMediaGroupMoveItems(targetGroup, { taskControl, directoryCache })
           : targetGroup;
         analyzed.push(await analyzeMediaSourceGroup(finalGroup, { onProgress }));
       }
@@ -14077,6 +14879,8 @@
       createdAt: Date.now(),
       rootParentId: getMediaOrganizeRootParentId(),
       groups: analyzed,
+      elapsedMs: Date.now() - startedAt,
+      directoryCacheSize: directoryCache.size,
     };
     renderMediaOrganizeList();
     if (UI.mediaOrganizeDetails) {
@@ -14089,12 +14893,60 @@
     return String(CONFIG.mediaOrganize.rootParentId || UI.fields.mediaRootParentId?.value || getCurrentListContext().parentId || CONFIG.request.manualListBody.parentId || '').trim();
   }
 
+  async function refreshMediaGroupMoveItemsForExecution(group, options = {}) {
+    const sourceItem = group?.sourceItem || null;
+    if (!group || group.moveAsFolder || !sourceItem || !shouldTreatItemAsDirectory(sourceItem)) {
+      return group;
+    }
+
+    try {
+      const refreshed = await resolveMediaGroupMoveItems({
+        ...group,
+        items: [],
+        itemIds: [],
+        needsChildListing: true,
+        moveAsFolder: false,
+        seasonFolderGroups: null,
+      }, {
+        taskControl: options.taskControl || null,
+        directoryCache: options.directoryCache || null,
+        forceRefresh: true,
+        ignoreCapturedCache: true,
+      });
+      const refreshedItems = Array.isArray(refreshed.items)
+        ? refreshed.items.filter((item) => item && getMediaItemIdentity(item))
+        : [];
+      if (!refreshedItems.length && !refreshed.moveAsFolder) {
+        return group;
+      }
+      return {
+        ...group,
+        sourceItem: refreshed.sourceItem || group.sourceItem,
+        items: refreshedItems.length ? refreshedItems : (refreshed.items || group.items || []),
+        itemIds: (refreshed.itemIds && refreshed.itemIds.length
+          ? refreshed.itemIds
+          : refreshedItems.map((item) => getMediaItemIdentity(item))).filter(Boolean),
+        moveAsFolder: refreshed.moveAsFolder === true,
+        needsChildListing: false,
+        childListingTruncated: Boolean(refreshed.childListingTruncated),
+        childListingWarning: refreshed.childListingWarning || group.childListingWarning || '',
+        unwrappedSourceFolders: refreshed.unwrappedSourceFolders || group.unwrappedSourceFolders,
+        executionRefreshedAt: Date.now(),
+      };
+    } catch (err) {
+      warn('执行媒体整理前刷新源文件夹列表失败，继续使用预览结果：', err);
+      return group;
+    }
+  }
+
   async function executeMediaOrganizePlan(options = {}) {
     const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
     const taskControl = options.taskControl || null;
+    const startedAt = Date.now();
+    const directoryCache = options.directoryCache || new Map();
     const groups = Array.isArray(STATE.mediaOrganizePreviewItems) && STATE.mediaOrganizePreviewItems.length
       ? STATE.mediaOrganizePreviewItems
-      : await previewMediaOrganizeSelection(options);
+      : await previewMediaOrganizeSelection({ ...options, directoryCache });
     if (!groups.length) {
       throw new Error('当前没有可执行的智能整理预览。');
     }
@@ -14116,7 +14968,12 @@
     };
     for (let index = 0; index < groups.length; index += 1) {
       await waitForTaskControl(taskControl);
-      const group = groups[index];
+      const previewGroup = groups[index];
+      const group = await refreshMediaGroupMoveItemsForExecution(previewGroup, {
+        taskControl,
+        directoryCache,
+      });
+      groups[index] = group;
       if (onProgress) {
         onProgress({
           visible: true,
@@ -14126,13 +14983,13 @@
         });
       }
       try {
-        const targetParentId = await ensureCloudDirectoryPath(group.targetSegments || ['其他', '未识别'], rootParentId, { cache: dirCache, taskControl });
+        const targetParentId = await ensureCloudDirectoryPath(group.targetSegments || ['其他', '未识别'], rootParentId, { cache: dirCache, directoryCache, taskControl });
         const sourceItems = group.moveAsFolder && group.sourceItem?.fileId
           ? [group.sourceItem]
           : (Array.isArray(group.items) && group.items.length
             ? group.items
             : (group.itemIds || []).map((id) => ({ fileId: String(id || '') })));
-        const duplicateCheck = await filterMediaItemsAlreadyInTarget(sourceItems, targetParentId, { taskControl });
+        const duplicateCheck = await filterMediaItemsAlreadyInTarget(sourceItems, targetParentId, { directoryCache, taskControl });
         if (duplicateCheck.duplicateItems.length) {
           result.duplicateSkipped += duplicateCheck.duplicateItems.length;
           result.fail += duplicateCheck.duplicateItems.length;
@@ -14148,10 +15005,22 @@
           label: `智能整理：${shortDisplayName(group.sourceName, 18)}`,
           batchSize: Math.max(1, Number(CONFIG.mediaOrganize.batchSize || CONFIG.move.batchSize || 10)),
           verifySourceItems: duplicateCheck.moveItems || [],
+          taskPollMaxTries: 10,
+          verifyMaxRounds: 4,
+          allowSplitRetry: true,
         });
         result.ok += moved.ok;
         result.fail += moved.fail;
         result.movedFileIds.push(...(moved.movedFileIds || []));
+        if ((moved.movedFileIds || []).length) {
+          directoryCache.delete(String(targetParentId || ''));
+          for (const item of duplicateCheck.moveItems || []) {
+            const sourceParentId = String(item?.parentId || group.parentId || '').trim();
+            if (sourceParentId) {
+              directoryCache.delete(sourceParentId);
+            }
+          }
+        }
         if (moved.firstError) {
           result.failures.push(`${group.sourceName}：${moved.firstError}`);
         }
@@ -14206,9 +15075,9 @@
         sourceName: parentItem.name || group.parentGroupName || parentId,
       });
     }
-    result.cleanup = await deleteMediaSourceFoldersIfEmpty(cleanupGroups, { onProgress, taskControl });
+    result.cleanup = await deleteMediaSourceFoldersIfEmpty(cleanupGroups, { onProgress, directoryCache, taskControl });
     if (cleanupParentItems.length) {
-      const parentCleanup = await deleteMediaSourceFoldersIfEmpty(cleanupParentItems, { onProgress, taskControl });
+      const parentCleanup = await deleteMediaSourceFoldersIfEmpty(cleanupParentItems, { onProgress, directoryCache, taskControl });
       result.cleanup = {
         deleted: (result.cleanup?.deleted || 0) + (parentCleanup.deleted || 0),
         skipped: (result.cleanup?.skipped || 0) + (parentCleanup.skipped || 0),
@@ -14219,13 +15088,16 @@
     if (onProgress) {
       const cleanupText = result.cleanup?.deleted ? `，清理空文件夹 ${result.cleanup.deleted} 个` : '';
       const duplicateText = result.duplicateSkipped ? `，跳过重复 ${result.duplicateSkipped} 项` : '';
+      const elapsedText = `，耗时 ${Math.max(1, Math.round((Date.now() - startedAt) / 1000))} 秒`;
       onProgress({
         visible: true,
         percent: 100,
         indeterminate: false,
-        text: `智能整理完成：成功 ${result.ok} 项，失败 ${result.fail} 项${duplicateText}${cleanupText}`,
+        text: `智能整理完成：成功 ${result.ok} 项，失败 ${result.fail} 项${duplicateText}${cleanupText}${elapsedText}`,
       });
     }
+    result.elapsedMs = Date.now() - startedAt;
+    result.directoryCacheSize = directoryCache.size;
     return result;
   }
 
@@ -18402,8 +19274,11 @@
               onProgress: (state) => setProgressBar(state),
               taskControl,
             });
-            setProgressBar({ visible: true, percent: 100, indeterminate: false, text: `媒体识别完成：${groups.length} 组` });
-            updatePanelStatus(`媒体智能整理预览完成：${groups.length} 组；请核对目标目录后再执行整理`);
+            const elapsedSeconds = Math.max(1, Math.round(Number(STATE.mediaOrganizePlan?.elapsedMs || 0) / 1000));
+            const tmdbFallbackCount = groups.filter((item) => /TMDB/u.test(String(item.error || ''))).length;
+            const fallbackText = tmdbFallbackCount ? `；${tmdbFallbackCount} 组已走本地规则` : '';
+            setProgressBar({ visible: true, percent: 100, indeterminate: false, text: `媒体识别完成：${groups.length} 组，耗时 ${elapsedSeconds} 秒${fallbackText}` });
+            updatePanelStatus(`媒体智能整理预览完成：${groups.length} 组，耗时 ${elapsedSeconds} 秒${fallbackText}；请核对目标目录后再执行整理`);
           });
           return;
         }
@@ -18420,7 +19295,8 @@
             });
             renderMediaOrganizeList();
             const failureText = result.failures?.length ? `；首个失败：${result.failures[0]}` : '';
-            updatePanelStatus(`媒体智能整理完成：成功 ${result.ok} 项，失败 ${result.fail} 项${failureText}`);
+            const elapsedText = result.elapsedMs ? `，耗时 ${Math.max(1, Math.round(result.elapsedMs / 1000))} 秒` : '';
+            updatePanelStatus(`媒体智能整理完成：成功 ${result.ok} 项，失败 ${result.fail} 项${elapsedText}${failureText}`);
           });
           return;
         }
@@ -19171,6 +20047,7 @@
 
   loadPersistedConfig();
   injectNetworkHook();
+  installMediaSelectionTracker();
   registerMenu();
   mountPanelWhenReady();
 
@@ -19201,6 +20078,7 @@
     moveCheckedItemsUpOneLevel,
     moveCheckedItemsToTargetDirectory,
     scanEmptyLeafDirectories,
+    debugMediaSelection,
     extractMagnetLinks,
     applyPanelConfig,
     savePersistedConfig,
